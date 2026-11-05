@@ -15,6 +15,7 @@ import type {
   PotokReaction,
   PotokSubgroup,
   PotokSubgroupListOptions,
+  PotokSubgroupPage,
   PotokValue,
 } from './potok';
 
@@ -39,6 +40,7 @@ const VALUES_STORAGE_KEY = 'potok-dev:values';
 const SUBGROUPS_STORAGE_KEY = 'potok-dev:subgroups';
 const CHILDREN_STORAGE_KEY = 'potok-dev:children';
 const GROUP_STORAGE_KEY = 'potok-dev:group';
+const LINK_PARAM = 'at';
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 200;
 const DEFAULT_SUBGROUP_LIMIT = 20;
@@ -132,6 +134,33 @@ function loadSubgroups(): Record<string, PotokSubgroup[]> {
   } catch {
     return {};
   }
+}
+
+/** The period of `listSubgroups` and `listChildren`, or `invalid_date` for what is no moment. */
+function inPeriod(
+  options: PotokSubgroupListOptions,
+): ((group: PotokSubgroup) => boolean) | { ok: false; error: 'invalid_date' } {
+  const moment = (value: string | undefined) => (value === undefined ? undefined : Date.parse(value));
+  const from = moment(options.from);
+  const to = moment(options.to);
+
+  if (Number.isNaN(from) || Number.isNaN(to)) return { ok: false, error: 'invalid_date' };
+
+  return (group) => {
+    const placed = Date.parse(group.published_at ?? group.inserted_at);
+    return (from === undefined || placed >= from) && (to === undefined || placed < to);
+  };
+}
+
+/** The answer to `aroundId`; null when the rows, newest first, do not hold that group. */
+function aroundPage(rows: PotokSubgroup[], aroundId: number | undefined, limit: number): PotokSubgroupPage | null {
+  const index = rows.findIndex((group) => group.id === aroundId);
+  if (index < 0) return null;
+
+  const first = Math.max(0, index - limit);
+  const end = index + limit + 1;
+
+  return { ok: true, groups: rows.slice(first, end), has_more: rows.length > end, has_newer: first > 0 };
 }
 
 function saveSubgroups(subgroups: Record<string, PotokSubgroup[]>) {
@@ -417,19 +446,22 @@ function createServer(el: HTMLElement) {
     listSubgroups(
       name: string,
       options: PotokSubgroupListOptions,
-    ): { ok: true; groups: PotokSubgroup[]; has_more: boolean } | PotokError {
+    ): PotokSubgroupPage | PotokError {
       const groups = loadSubgroups()[name];
       if (!groups) return { ok: false, error: 'not_found' };
 
       const limit = Math.min(nonNegativeInteger(options.limit) ?? DEFAULT_SUBGROUP_LIMIT, MAX_SUBGROUP_LIMIT);
       const beforeId = nonNegativeInteger(options.beforeId);
+      const period = inPeriod(options);
+      if (typeof period !== 'function') return period;
 
-      const rows = groups
-        .filter((group) => beforeId === undefined || group.id < beforeId)
-        .sort((a, b) => b.id - a.id)
-        .slice(0, limit + 1);
+      const inOrder = groups.filter(period).sort((a, b) => b.id - a.id);
+      const around = aroundPage(inOrder, nonNegativeInteger(options.aroundId), limit);
+      if (around) return around;
 
-      return { ok: true, groups: rows.slice(0, limit), has_more: rows.length > limit };
+      const rows = inOrder.filter((group) => beforeId === undefined || group.id < beforeId).slice(0, limit + 1);
+
+      return { ok: true, groups: rows.slice(0, limit), has_more: rows.length > limit, has_newer: false };
     },
 
     openGroup(id: number, tab: PotokGroupTab | undefined): { ok: true } | PotokError {
@@ -468,34 +500,53 @@ function createServer(el: HTMLElement) {
       return emoji ? { ok: true, emoji } : { ok: false, error: 'cancelled' };
     },
 
-    shareGroup(id: number): { ok: true } | PotokError {
+    shareGroup(id: number, inApp: boolean | undefined): { ok: true } | PotokError {
       const known = Object.values(loadSubgroups()).some((groups) => groups.some((group) => group.id === id));
       if (!known) return { ok: false, error: 'not_found' };
 
-      console.info(`[potok-dev] shareGroup: in potok the page offers to share /groups/${id}.`);
+      const link = inApp ? `/groups/${ownGroup.id}/group_home?at=${id}` : `/groups/${id}`;
+      console.info(`[potok-dev] shareGroup: in potok the page offers to share ${link}.`);
       return { ok: true };
+    },
+
+    linkGroup(id: number): { ok: true } | PotokError {
+      if (!Number.isSafeInteger(id) || id <= 0) return { ok: false, error: 'invalid_group' };
+
+      const url = new URL(location.href);
+      url.searchParams.set(LINK_PARAM, String(id));
+      history.replaceState(history.state, '', url);
+      return { ok: true };
+    },
+
+    getLinkedGroup(): { ok: true; group_id: number | null } {
+      return { ok: true, group_id: Number(new URLSearchParams(location.search).get(LINK_PARAM)) || null };
     },
 
     getGroup(): { ok: true; group: PotokOwnGroup } {
       return { ok: true, group: ownGroup };
     },
 
-    listChildren(options: PotokSubgroupListOptions): { ok: true; groups: PotokSubgroup[]; has_more: boolean } | PotokError {
+    listChildren(options: PotokSubgroupListOptions): PotokSubgroupPage | PotokError {
       if (!ownGroup.can_manage_children) return forbidden;
 
       const limit = Math.min(nonNegativeInteger(options.limit) ?? DEFAULT_SUBGROUP_LIMIT, MAX_SUBGROUP_LIMIT);
       const beforeId = nonNegativeInteger(options.beforeId);
+      const period = inPeriod(options);
+      if (typeof period !== 'function') return period;
       const before = children.find((group) => group.id === beforeId);
 
-      const rows = [...children]
-        .sort(compareFeedOrder)
+      const inOrder = [...children].sort(compareFeedOrder).filter(period);
+      const around = aroundPage(inOrder, nonNegativeInteger(options.aroundId), limit);
+      if (around) return around;
+
+      const rows = inOrder
         .filter((group) => {
           if (beforeId === undefined) return true;
           return before ? compareFeedOrder(before, group) < 0 : group.id < beforeId;
         })
         .slice(0, limit + 1);
 
-      return { ok: true, groups: rows.slice(0, limit), has_more: rows.length > limit };
+      return { ok: true, groups: rows.slice(0, limit), has_more: rows.length > limit, has_newer: false };
     },
 
     getChild(id: number): { ok: true; group: PotokChild } | PotokError {
@@ -628,8 +679,16 @@ function createSdk(server: DevServer): PotokSdk {
       return server.pickEmoji();
     },
 
-    async shareGroup(id) {
-      return server.shareGroup(id);
+    async shareGroup(id, options = {}) {
+      return server.shareGroup(id, options.inApp);
+    },
+
+    async linkGroup(id) {
+      return server.linkGroup(id);
+    },
+
+    async getLinkedGroup() {
+      return server.getLinkedGroup();
     },
 
     async getGroup() {

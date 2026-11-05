@@ -1,13 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   createFeed,
+  describeFilter,
   FEED_GROUP,
+  filterMoments,
+  lastDays,
   LOAD_AHEAD,
-  MAX_RETURN_PAGES,
+  makeFilter,
   NOTICE_MS,
   PAGE_SIZE,
   publishedOn,
+  RETURN_FILTER_KEY,
   RETURN_KEY,
+  today,
   type FeedState,
 } from './feed';
 import type { PotokError, PotokSdk, PotokSubgroup, PotokSubgroupListOptions } from './potok';
@@ -36,9 +41,23 @@ function server(count: number) {
 
   return vi.fn(async (_name: string, options: PotokSubgroupListOptions = {}) => {
     const limit = options.limit ?? PAGE_SIZE;
+    const index = stories.findIndex((row) => row.id === options.aroundId);
+
+    if (index >= 0) {
+      const first = Math.max(0, index - limit);
+      const end = index + limit + 1;
+
+      return {
+        ok: true as const,
+        groups: stories.slice(first, end),
+        has_more: stories.length > end,
+        has_newer: first > 0,
+      };
+    }
+
     const rows = stories.filter((row) => options.beforeId === undefined || row.id < options.beforeId);
 
-    return { ok: true as const, groups: rows.slice(0, limit), has_more: rows.length > limit };
+    return { ok: true as const, groups: rows.slice(0, limit), has_more: rows.length > limit, has_newer: false };
   });
 }
 
@@ -62,6 +81,8 @@ function setup({
   toggleGroupReaction = vi.fn(async () => ({ ok: true as const, reactions: reacted })),
   pickEmoji = vi.fn(async () => ({ ok: true as const, emoji: '🎉' })),
   shareGroup = vi.fn(async () => ({ ok: true as const })),
+  linkGroup = vi.fn(async () => ({ ok: true as const })),
+  getLinkedGroup = vi.fn(async () => ({ ok: true as const, group_id: null as number | null })),
   storage = memoryStorage(),
 }: {
   listSubgroups?: PotokSdk['listSubgroups'];
@@ -69,16 +90,29 @@ function setup({
   toggleGroupReaction?: PotokSdk['toggleGroupReaction'];
   pickEmoji?: PotokSdk['pickEmoji'];
   shareGroup?: PotokSdk['shareGroup'];
+  linkGroup?: PotokSdk['linkGroup'];
+  getLinkedGroup?: PotokSdk['getLinkedGroup'];
   storage?: ReturnType<typeof memoryStorage>;
 } = {}) {
   const changes: FeedState[] = [];
   const feed = createFeed(
-    { listSubgroups, openGroup, toggleGroupReaction, pickEmoji, shareGroup },
+    { listSubgroups, openGroup, toggleGroupReaction, pickEmoji, shareGroup, linkGroup, getLinkedGroup },
     storage,
     (state) => changes.push(state),
   );
 
-  return { feed, listSubgroups, openGroup, toggleGroupReaction, pickEmoji, shareGroup, storage, changes };
+  return {
+    feed,
+    listSubgroups,
+    openGroup,
+    toggleGroupReaction,
+    pickEmoji,
+    shareGroup,
+    linkGroup,
+    getLinkedGroup,
+    storage,
+    changes,
+  };
 }
 
 describe('the first load', () => {
@@ -228,25 +262,14 @@ describe('leaving a story and coming back', () => {
     expect(listSubgroups).toHaveBeenCalledTimes(1);
   });
 
-  it('loads pages until it finds the story', async () => {
-    const { feed, listSubgroups } = setup({ storage: memoryStorage({ [RETURN_KEY]: '25' }) });
+  it('asks around the story, however far down it lies', async () => {
+    const { feed, listSubgroups, storage } = setup({ storage: memoryStorage({ [RETURN_KEY]: '12' }) });
 
     await feed.start();
 
-    expect(feed.state.startId).toBe(25);
-    expect(listSubgroups).toHaveBeenCalledTimes(2);
-  });
-
-  it('gives up after a few pages and opens on the newest', async () => {
-    const { feed, listSubgroups, storage } = setup({
-      listSubgroups: server(500),
-      storage: memoryStorage({ [RETURN_KEY]: '1' }),
-    });
-
-    await feed.start();
-
-    expect(feed.state.startId).toBeNull();
-    expect(listSubgroups).toHaveBeenCalledTimes(MAX_RETURN_PAGES);
+    expect(listSubgroups).toHaveBeenCalledTimes(1);
+    expect(listSubgroups).toHaveBeenCalledWith(FEED_GROUP, expect.objectContaining({ aroundId: 12 }));
+    expect(feed.state.startId).toBe(12);
     expect(storage.getItem(RETURN_KEY)).toBeNull();
   });
 
@@ -418,7 +441,7 @@ describe('sharing a story', () => {
 
     await feed.share(50);
 
-    expect(shareGroup).toHaveBeenCalledWith(50);
+    expect(shareGroup).toHaveBeenCalledWith(50, { inApp: true });
     expect(feed.state.notice).toBeNull();
   });
 
@@ -429,5 +452,312 @@ describe('sharing a story', () => {
     await feed.share(50);
 
     expect(feed.state.notice).toBe('share');
+  });
+});
+
+describe('a period of publication', () => {
+  const noon = new Date(2026, 10, 5, 12);
+
+  it('takes what the form gives', () => {
+    expect(makeFilter('', '')).toBeNull();
+    expect(makeFilter('2026-11-01', '')).toEqual({ from: '2026-11-01', to: null });
+    expect(makeFilter('', '2026-11-05')).toEqual({ from: null, to: '2026-11-05' });
+  });
+
+  it('turns around dates given the wrong way', () => {
+    expect(makeFilter('2026-11-05', '2026-11-01')).toEqual({ from: '2026-11-01', to: '2026-11-05' });
+  });
+
+  it('counts today among the last days', () => {
+    expect(lastDays(1, noon)).toEqual({ from: '2026-11-05', to: '2026-11-05' });
+    expect(lastDays(7, noon)).toEqual({ from: '2026-10-30', to: '2026-11-05' });
+  });
+
+  it('knows today in the viewer\'s days, late in the evening too', () => {
+    expect(today(new Date(2026, 10, 5, 23, 59))).toBe('2026-11-05');
+  });
+
+  it('runs from the start of the first day to the start of the day after the last', () => {
+    expect(filterMoments({ from: '2026-11-01', to: '2026-11-05' })).toEqual({
+      from: new Date(2026, 10, 1).toISOString(),
+      to: new Date(2026, 10, 6).toISOString(),
+    });
+  });
+
+  it('crosses the end of a month', () => {
+    expect(filterMoments({ from: null, to: '2026-10-31' }).to).toBe(new Date(2026, 10, 1).toISOString());
+  });
+
+  it('leaves an open end out, and asks for nothing without a period', () => {
+    expect(filterMoments({ from: '2026-11-01', to: null }).to).toBeUndefined();
+    expect(filterMoments(null)).toEqual({ from: undefined, to: undefined });
+  });
+
+  it('reads well', () => {
+    expect(describeFilter({ from: '2026-11-05', to: '2026-11-05' })).toBe('5. nov 2026.');
+    expect(describeFilter({ from: '2026-11-01', to: '2026-11-05' })).toBe('1. nov 2026. – 5. nov 2026.');
+    expect(describeFilter({ from: '2026-11-01', to: null })).toBe('od 1. nov 2026.');
+    expect(describeFilter({ from: null, to: '2026-11-05' })).toBe('do 5. nov 2026.');
+  });
+});
+
+describe('filtering by date', () => {
+  const period = { from: '2026-11-01', to: '2026-11-05' };
+
+  it('starts over with the period, on the first page', async () => {
+    const { feed, listSubgroups } = setup();
+    await feed.start();
+
+    await feed.applyFilter(period);
+
+    expect(listSubgroups).toHaveBeenLastCalledWith(FEED_GROUP, {
+      limit: PAGE_SIZE,
+      beforeId: undefined,
+      ...filterMoments(period),
+    });
+    expect(feed.state.filter).toEqual(period);
+    expect(feed.state.stories).toHaveLength(PAGE_SIZE);
+    expect(feed.state.started).toBe(true);
+    expect(feed.state.loading).toBe(false);
+  });
+
+  it('sends the period with the next pages too', async () => {
+    const { feed, listSubgroups } = setup();
+    await feed.start();
+    await feed.applyFilter(period);
+
+    feed.reached(PAGE_SIZE - 1);
+    await vi.waitFor(() => expect(feed.state.stories).toHaveLength(PAGE_SIZE * 2));
+
+    expect(listSubgroups).toHaveBeenLastCalledWith(FEED_GROUP, {
+      limit: PAGE_SIZE,
+      beforeId: 31,
+      ...filterMoments(period),
+    });
+  });
+
+  it('goes back to all stories', async () => {
+    const { feed, listSubgroups } = setup();
+    await feed.start();
+    await feed.applyFilter(period);
+
+    await feed.applyFilter(null);
+
+    expect(feed.state.filter).toBeNull();
+    expect(listSubgroups).toHaveBeenLastCalledWith(FEED_GROUP, {
+      limit: PAGE_SIZE,
+      beforeId: undefined,
+      from: undefined,
+      to: undefined,
+    });
+  });
+
+  it('drops a page of the old period that arrives late', async () => {
+    let answerOld: (reply: { ok: true; groups: PotokSubgroup[]; has_more: boolean }) => void = () => {};
+
+    const listSubgroups = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise((resolve) => (answerOld = resolve)))
+      .mockResolvedValue({ ok: true, groups: [story(3)], has_more: false });
+
+    const { feed } = setup({ listSubgroups });
+
+    void feed.start();
+    await vi.waitFor(() => expect(listSubgroups).toHaveBeenCalledTimes(1));
+
+    await feed.applyFilter(period);
+    answerOld({ ok: true, groups: [story(50), story(49)], has_more: true });
+    await new Promise((resolve) => setTimeout(resolve));
+
+    expect(feed.state.stories.map((row) => row.id)).toEqual([3]);
+    expect(feed.state.hasMore).toBe(false);
+  });
+
+  it('keeps the period through a chat, and only then', async () => {
+    const storage = memoryStorage();
+    const first = setup({ storage });
+    await first.feed.start();
+    await first.feed.applyFilter(period);
+
+    await first.feed.open(40);
+    expect(JSON.parse(storage.getItem(RETURN_FILTER_KEY) as string)).toEqual(period);
+
+    const back = setup({ storage });
+    await back.feed.start();
+
+    expect(back.feed.state.filter).toEqual(period);
+    expect(back.listSubgroups).toHaveBeenCalledWith(FEED_GROUP, expect.objectContaining(filterMoments(period)));
+    expect(storage.getItem(RETURN_FILTER_KEY)).toBeNull();
+
+    const fresh = setup({ storage });
+    await fresh.feed.start();
+    expect(fresh.feed.state.filter).toBeNull();
+  });
+
+  it('forgets the period when the story could not be opened', async () => {
+    const storage = memoryStorage();
+    const { feed } = setup({ storage, openGroup: failing('not_found') });
+    await feed.start();
+    await feed.applyFilter(period);
+
+    await feed.open(40);
+
+    expect(storage.getItem(RETURN_FILTER_KEY)).toBeNull();
+    expect(feed.state.filter).toEqual(period);
+  });
+
+  it('survives something unreadable in the storage', async () => {
+    const { feed } = setup({ storage: memoryStorage({ [RETURN_FILTER_KEY]: 'not json' }) });
+
+    await feed.start();
+
+    expect(feed.state.filter).toBeNull();
+    expect(feed.state.stories).toHaveLength(PAGE_SIZE);
+  });
+
+  it('keeps the period when trying again after a failure', async () => {
+    const listSubgroups = vi.fn(server(50));
+    const { feed } = setup({ listSubgroups });
+    await feed.start();
+
+    listSubgroups.mockImplementationOnce(failing('disconnected'));
+    await feed.applyFilter(period);
+    expect(feed.state.failure).toBe('failed');
+
+    await feed.retry();
+
+    expect(feed.state.filter).toEqual(period);
+    expect(feed.state.failure).toBeNull();
+    expect(listSubgroups).toHaveBeenLastCalledWith(FEED_GROUP, expect.objectContaining(filterMoments(period)));
+  });
+
+  it('closes the form when a period is chosen', async () => {
+    const { feed } = setup();
+    await feed.start();
+
+    feed.openFilter();
+    expect(feed.state.filterOpen).toBe(true);
+
+    await feed.applyFilter(period);
+    expect(feed.state.filterOpen).toBe(false);
+  });
+});
+
+describe('a link to a story', () => {
+  const linkedTo = (id: number) => vi.fn(async () => ({ ok: true as const, group_id: id }));
+
+  it('opens the feed on that story, with its neighbours around it', async () => {
+    const { feed } = setup({ getLinkedGroup: linkedTo(30) });
+
+    await feed.start();
+
+    expect(feed.state.startId).toBe(30);
+    expect(feed.state.stories.map((row) => row.id)).toContain(30);
+    expect(feed.state.stories[0].id).toBe(50);
+    expect(feed.state.hasNewer).toBe(false);
+  });
+
+  it('says when there are newer stories above what came', async () => {
+    const { feed } = setup({ getLinkedGroup: linkedTo(10) });
+
+    await feed.start();
+
+    expect(feed.state.stories[0].id).toBe(30);
+    expect(feed.state.hasNewer).toBe(true);
+    expect(feed.state.hasMore).toBe(false);
+  });
+
+  it('goes on to older stories from the end of what came', async () => {
+    const { feed, listSubgroups } = setup({ getLinkedGroup: linkedTo(40) });
+    await feed.start();
+
+    expect(feed.state.stories.at(-1)?.id).toBe(20);
+
+    feed.reached(feed.state.stories.length - 1);
+    await vi.waitFor(() => expect(feed.state.loading).toBe(false));
+
+    expect(listSubgroups).toHaveBeenLastCalledWith(FEED_GROUP, expect.objectContaining({ beforeId: 20 }));
+    expect(feed.state.stories.at(-1)?.id).toBe(1);
+  });
+
+  it('opens on the newest when the viewer cannot see that story', async () => {
+    const { feed } = setup({ getLinkedGroup: linkedTo(999) });
+
+    await feed.start();
+
+    expect(feed.state.startId).toBeNull();
+    expect(feed.state.stories[0].id).toBe(50);
+  });
+
+  it('prefers the story the viewer came back to', async () => {
+    const { feed, listSubgroups } = setup({
+      getLinkedGroup: linkedTo(30),
+      storage: memoryStorage({ [RETURN_KEY]: '12' }),
+    });
+
+    await feed.start();
+
+    expect(listSubgroups).toHaveBeenCalledWith(FEED_GROUP, expect.objectContaining({ aroundId: 12 }));
+    expect(feed.state.startId).toBe(12);
+  });
+
+  it('works when the address cannot be read', async () => {
+    const { feed } = setup({ getLinkedGroup: () => Promise.reject(new Error('timed out')) });
+
+    await feed.start();
+
+    expect(feed.state.stories).toHaveLength(PAGE_SIZE);
+    expect(feed.state.started).toBe(true);
+  });
+
+  it('goes back to the newest with the period that is on', async () => {
+    const { feed, listSubgroups } = setup({ getLinkedGroup: linkedTo(10) });
+    await feed.start();
+
+    await feed.applyFilter(feed.state.filter);
+
+    expect(feed.state.hasNewer).toBe(false);
+    expect(feed.state.stories[0].id).toBe(50);
+    expect(listSubgroups).toHaveBeenLastCalledWith(FEED_GROUP, expect.objectContaining({ aroundId: undefined }));
+  });
+});
+
+describe('the address of the page', () => {
+  it('follows the story on screen', async () => {
+    const linkGroup = vi.fn(async (_id: number) => ({ ok: true as const }));
+    const { feed } = setup({ linkGroup });
+    await feed.start();
+
+    feed.reached(0);
+    feed.reached(3);
+
+    expect(linkGroup.mock.calls.map(([id]) => id)).toEqual([50, 47]);
+    expect(feed.state.index).toBe(3);
+  });
+
+  it('is written once per story, however often the position is told', async () => {
+    const { feed, linkGroup } = setup();
+    await feed.start();
+
+    feed.reached(2);
+    feed.reached(2);
+    feed.reached(2);
+
+    expect(linkGroup).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not stop the feed when it cannot be written', async () => {
+    const { feed } = setup({ linkGroup: () => Promise.reject(new Error('timed out')) });
+    await feed.start();
+
+    expect(() => feed.reached(1)).not.toThrow();
+  });
+
+  it('waits for a story to be there', async () => {
+    const { feed, linkGroup } = setup();
+
+    feed.reached(0);
+
+    expect(linkGroup).not.toHaveBeenCalled();
   });
 });

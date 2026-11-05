@@ -1,10 +1,28 @@
 import { html, nothing, render, type TemplateResult } from 'lit-html';
 import { unsafeHTML } from 'lit-html/directives/unsafe-html.js';
-import { createFeed, FEED_GROUP, publishedOn, type Feed, type FeedState, type Notice } from './feed';
+import {
+  createFeed,
+  describeFilter,
+  FEED_GROUP,
+  lastDays,
+  makeFilter,
+  publishedOn,
+  today,
+  type DateFilter,
+  type Feed,
+  type FeedState,
+  type Notice,
+} from './feed';
 import type { PotokSubgroup } from './potok';
 
 /** The same six as on a message on the phone; the seventh button opens all of them. */
 const QUICK_EMOJI = ['👍', '❤️', '😂', '😮', '😢', '🙏'];
+
+const SHORTCUTS: [label: string, days: number][] = [
+  ['Danas', 1],
+  ['7 dana', 7],
+  ['30 dana', 30],
+];
 
 const NOTICES: Record<Notice, string> = {
   open: 'Ova vest trenutno ne može da se otvori.',
@@ -39,6 +57,22 @@ const shareIcon = html`
       stroke-linejoin="round"
       d="M7.217 10.907a2.25 2.25 0 1 0 0 2.186m0-2.186c.18.324.283.696.283 1.093s-.103.77-.283 1.093m0-2.186 9.566-5.314m-9.566 7.5 9.566 5.314m0 0a2.25 2.25 0 1 0 3.935 2.186 2.25 2.25 0 0 0-3.935-2.186Zm0-12.814a2.25 2.25 0 1 0 3.933-2.185 2.25 2.25 0 0 0-3.933 2.185Z"
     />
+  </svg>
+`;
+
+const calendarIcon = html`
+  <svg class="size-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+    <path
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      d="M6.75 3v2.25M17.25 3v2.25M3 18.75V7.5a2.25 2.25 0 0 1 2.25-2.25h13.5A2.25 2.25 0 0 1 21 7.5v11.25m-18 0A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75m-18 0v-7.5A2.25 2.25 0 0 1 5.25 9h13.5A2.25 2.25 0 0 1 21 11.25v7.5"
+    />
+  </svg>
+`;
+
+const closeIcon = html`
+  <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">
+    <path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" />
   </svg>
 `;
 
@@ -104,6 +138,110 @@ const reactionPills = (feed: Feed, story: PotokSubgroup) =>
         )}
       </div>`;
 
+/** What stays in sight while a period is on: a tap changes it, the cross takes it off. */
+const filterChip = (feed: Feed, filter: DateFilter) => html`
+  <div class="bg-base-100 border-base-300 flex min-w-0 items-center rounded-full border text-sm shadow-md" data-filter-chip>
+    <button class="flex min-w-0 items-center gap-1.5 py-1.5 pr-1 pl-3" aria-haspopup="dialog" @click=${() => feed.openFilter()}>
+      ${calendarIcon}<span class="truncate">${describeFilter(filter)}</span>
+    </button>
+    <button
+      class="hover:bg-base-200 mr-1 inline-flex size-7 shrink-0 items-center justify-center rounded-full"
+      aria-label="Prikaži sve vesti"
+      data-filter-clear
+      @click=${() => void feed.applyFilter(null)}
+    >
+      ${closeIcon}
+    </button>
+  </div>
+`;
+
+/** A link opened deep in the list, with more above what was loaded around its story. */
+const newerChip = (feed: Feed, state: FeedState) => html`
+  <button
+    class="bg-base-100 border-base-300 shrink-0 rounded-full border px-3 py-1.5 text-sm shadow-md"
+    data-newer
+    @click=${() => void feed.applyFilter(state.filter)}
+  >
+    Novije vesti
+  </button>
+`;
+
+const topChips = (feed: Feed, state: FeedState) => {
+  const newer = state.hasNewer && state.index === 0;
+  if (!state.filter && !newer) return nothing;
+
+  return html`<div class="fixed top-2 left-1/2 z-20 flex max-w-[calc(100%-1rem)] -translate-x-1/2 gap-2">
+    ${newer ? newerChip(feed, state) : nothing} ${state.filter ? filterChip(feed, state.filter) : nothing}
+  </div>`;
+};
+
+const submitFilter = (feed: Feed, event: SubmitEvent) => {
+  event.preventDefault();
+
+  const form = new FormData(event.target as HTMLFormElement);
+  void feed.applyFilter(makeFilter(form.get('from') as string, form.get('to') as string));
+};
+
+const filterSheet = (feed: Feed, filter: DateFilter | null) => html`
+  <div
+    class="fixed inset-0 z-30 flex items-end justify-center bg-black/30 sm:items-center"
+    data-filter-sheet
+    @click=${(event: Event) => {
+      if (event.target === event.currentTarget) feed.closeFilter();
+    }}
+  >
+    <form
+      class="bg-base-100 text-base-content w-full max-w-md rounded-t-2xl p-5 shadow-xl sm:rounded-2xl"
+      role="dialog"
+      aria-label="Filter po datumu"
+      @submit=${(event: SubmitEvent) => submitFilter(feed, event)}
+    >
+      <div class="flex items-center justify-between">
+        <h2 class="text-lg font-semibold">Vesti po datumu</h2>
+        <button
+          type="button"
+          class="d-btn d-btn-ghost d-btn-sm d-btn-square"
+          aria-label="Zatvori"
+          data-filter-close
+          @click=${() => feed.closeFilter()}
+        >
+          ${closeIcon}
+        </button>
+      </div>
+      <div class="mt-3 flex gap-2">
+        ${SHORTCUTS.map(
+          ([label, days]) => html`<button
+            type="button"
+            class="d-btn d-btn-sm flex-1"
+            data-filter-days=${days}
+            @click=${() => void feed.applyFilter(lastDays(days))}
+          >
+            ${label}
+          </button>`,
+        )}
+      </div>
+      <div class="mt-4 grid grid-cols-2 gap-3">
+        <label class="min-w-0 text-sm">
+          Od
+          <input class="d-input d-input-sm mt-1 w-full" type="date" name="from" max=${today()} .value=${filter?.from ?? ''} />
+        </label>
+        <label class="min-w-0 text-sm">
+          Do
+          <input class="d-input d-input-sm mt-1 w-full" type="date" name="to" max=${today()} .value=${filter?.to ?? ''} />
+        </label>
+      </div>
+      <div class="mt-5 flex justify-end gap-2">
+        ${filter
+          ? html`<button type="button" class="d-btn d-btn-ghost d-btn-sm" @click=${() => void feed.applyFilter(null)}>
+              Prikaži sve
+            </button>`
+          : nothing}
+        <button class="d-btn d-btn-primary d-btn-sm" data-filter-apply>Primeni</button>
+      </div>
+    </form>
+  </div>
+`;
+
 const reactionTray = (feed: Feed, story: PotokSubgroup) => html`
   <div
     class="bg-base-100 border-base-300 absolute right-4 bottom-full z-10 mb-2 flex items-center gap-0.5 rounded-full border p-1 shadow-lg"
@@ -150,13 +288,24 @@ const storyCard = (feed: Feed, story: PotokSubgroup) => html`
         <div class="flex items-center gap-1">
           ${isDraft(story)
             ? html`<span class="min-w-0 flex-1"><span class="d-badge d-badge-warning d-badge-sm" data-draft>Nacrt</span></span>`
-            : html`<time
-                class="min-w-0 flex-1 truncate text-sm opacity-70"
-                datetime=${story.published_at ?? story.inserted_at}
-                data-published
-              >
-                ${publishedOn(story)}
-              </time>`}
+            : html`<span class="min-w-0 flex-1">
+                <button
+                  class="d-btn d-btn-ghost d-btn-sm -ml-2 max-w-full flex-nowrap gap-1.5 px-2 font-normal"
+                  aria-label="Filter po datumu"
+                  aria-haspopup="dialog"
+                  data-filter
+                  @click=${() => feed.openFilter()}
+                >
+                  ${calendarIcon}
+                  <time
+                    class="truncate opacity-70"
+                    datetime=${story.published_at ?? story.inserted_at}
+                    data-published
+                  >
+                    ${publishedOn(story)}
+                  </time>
+                </button>
+              </span>`}
           ${story.can_react && !isDraft(story)
             ? html`<button
                 class="d-btn d-btn-ghost d-btn-sm d-btn-square shrink-0"
@@ -209,10 +358,23 @@ const storyCard = (feed: Feed, story: PotokSubgroup) => html`
 const view = (feed: Feed, state: FeedState) => {
   if (!state.started) return message('Učitavam vesti…');
   if (state.stories.length === 0) {
-    return state.failure ? failureScreen(feed, state) : message('Još nema vesti');
+    if (state.failure) return failureScreen(feed, state);
+    if (!state.filter) return message('Još nema vesti');
+
+    return html`
+      ${message(
+        'Nema vesti u tom periodu',
+        describeFilter(state.filter),
+        html`<button class="d-btn d-btn-primary d-btn-sm mt-3" data-filter-all @click=${() => void feed.applyFilter(null)}>
+          Prikaži sve
+        </button>`,
+      )}
+    `;
   }
 
   return html`
+    ${topChips(feed, state)}
+    ${state.filterOpen ? filterSheet(feed, state.filter) : nothing}
     ${state.stories.map((story) => storyCard(feed, story))}
     ${state.failure ? message('Sledeće vesti nisu učitane', undefined, retryButton(feed)) : nothing}
     ${state.notice
@@ -224,6 +386,8 @@ const view = (feed: Feed, state: FeedState) => {
 };
 
 type Direction = 1 | -1;
+
+const inFilterSheet = (event: Event) => (event.target as Element).closest?.('[data-filter-sheet]') != null;
 
 // All cards are as high as the feed, so the position gives the story on screen.
 const currentIndex = (root: HTMLElement) => Math.round(root.scrollTop / root.clientHeight);
@@ -265,7 +429,7 @@ function followWheel(root: HTMLElement) {
     'wheel',
     (event) => {
       // Ctrl + wheel is the browser's zoom.
-      if (event.ctrlKey || event.deltaY === 0) return;
+      if (event.ctrlKey || event.deltaY === 0 || inFilterSheet(event)) return;
 
       const direction: Direction = event.deltaY > 0 ? 1 : -1;
       if (!moved && scrollableBody(root, direction)) return;
@@ -290,6 +454,7 @@ export function mountFeed(root: HTMLElement) {
 
   const feed = createFeed(window.potok, localStorage, (state) => {
     render(view(feed, state), root);
+    root.classList.toggle('feed-with-chips', state.filter !== null || state.hasNewer);
 
     // Back from a chat: straight to the story, with no animation through the others.
     if (state.startId !== null && jumpedTo !== state.startId) {
@@ -309,6 +474,9 @@ export function mountFeed(root: HTMLElement) {
   followWheel(root);
 
   window.addEventListener('keydown', (event) => {
+    // Arrows change the day in a date field.
+    if (inFilterSheet(event)) return;
+
     if (event.key === 'ArrowDown' || event.key === 'PageDown') {
       event.preventDefault();
       step(root, 1);
@@ -318,5 +486,5 @@ export function mountFeed(root: HTMLElement) {
     }
   });
 
-  void feed.start().then(() => feed.reached(0));
+  void feed.start().then(() => feed.reached(currentIndex(root)));
 }

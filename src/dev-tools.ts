@@ -31,7 +31,8 @@ function story(id: number): PotokSubgroup {
     is_public: true,
     inherits_members: true,
     creator_id: 1,
-    inserted_at: '2026-11-05T08:00:00Z',
+    // One a day, up to today, so the filter by date has something to find.
+    inserted_at: new Date(Date.now() - (45 - id) * 86_400_000).toISOString(),
     published_at: null,
     last_value_at: null,
     comment_count: id % 4 === 0 ? 0 : id * 3,

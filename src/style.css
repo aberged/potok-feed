@@ -47,3 +47,8 @@ body {
   min-height: 0;
   overflow-y: auto;
 }
+
+/* Room for what floats at the top, or it would sit on the headline. */
+.feed-with-chips .feed-body {
+  padding-top: 2.75rem;
+}

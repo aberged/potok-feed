@@ -25,6 +25,7 @@ export type PotokError = {
     | "invalid_description"
     | "invalid_group"
     | "invalid_emoji"
+    | "invalid_date"
     /** The viewer closed the picker of `pickEmoji`. */
     | "cancelled"
     | "unknown_method"
@@ -187,6 +188,26 @@ export type PotokSubgroupListOptions = {
   limit?: number;
   /** The id of the last group of the previous page. */
   beforeId?: number;
+  /** Only groups published at this moment or later: ISO 8601 with a zone. Send it with every page. */
+  from?: string;
+  /** Only groups published before this moment: ISO 8601 with a zone. Send it with every page. */
+  to?: string;
+  /**
+   * The groups around this one instead of the first page, however far down it
+   * lies: up to `limit` on each side. Look for its id in the reply, as a group
+   * the list does not hold gives the first page.
+   */
+  aroundId?: number;
+};
+
+/** A part of a list of sub-groups, newest first. */
+export type PotokSubgroupPage = {
+  ok: true;
+  groups: PotokSubgroup[];
+  /** There are older groups below these. */
+  has_more: boolean;
+  /** There are newer groups above these. Only `aroundId` can say so. */
+  has_newer: boolean;
 };
 
 /** `window.potok`. Calls reject if the page does not answer within 10s. */
@@ -212,7 +233,7 @@ export type PotokSdk = {
   listSubgroups(
     name: string,
     options?: PotokSubgroupListOptions,
-  ): Promise<{ ok: true; groups: PotokSubgroup[]; has_more: boolean } | PotokError>;
+  ): Promise<PotokSubgroupPage | PotokError>;
   /**
    * Takes the viewer to this group's parent, a direct sub-group or a group
    * `listSubgroups` can return: to its chat, with `tab: "description"` to its
@@ -229,9 +250,17 @@ export type PotokSdk = {
   pickEmoji(): Promise<{ ok: true; emoji: string } | PotokError>;
   /**
    * Opens the page's way of sharing with the link of a group `openGroup` can
-   * reach. A frame has neither Web Share nor the clipboard.
+   * reach. A frame has neither Web Share nor the clipboard. With `inApp` the link
+   * is to this app open on that group, which must lie below it.
    */
-  shareGroup(id: number): Promise<{ ok: true } | PotokError>;
+  shareGroup(id: number, options?: { inApp?: boolean }): Promise<{ ok: true } | PotokError>;
+  /**
+   * Puts a group in the page's address, with no new history entry, so that the
+   * address opens this app on it. The app finds it again with `getLinkedGroup`.
+   */
+  linkGroup(id: number): Promise<{ ok: true } | PotokError>;
+  /** The group in the page's address. Nothing checks it: `aroundId` does. */
+  getLinkedGroup(): Promise<{ ok: true; group_id: number | null } | PotokError>;
   getGroup(): Promise<{ ok: true; group: PotokOwnGroup } | PotokError>;
   /**
    * The direct sub-groups, in the order of `listSubgroups`. This and the calls
@@ -239,7 +268,7 @@ export type PotokSdk = {
    */
   listChildren(
     options?: PotokSubgroupListOptions,
-  ): Promise<{ ok: true; groups: PotokSubgroup[]; has_more: boolean } | PotokError>;
+  ): Promise<PotokSubgroupPage | PotokError>;
   getChild(id: number): Promise<{ ok: true; group: PotokChild } | PotokError>;
   /** Needs `can_create_children`. Without `isPublic` or `inheritsMembers` only the viewer sees the group. */
   createChild(attrs: PotokChildAttrs & { name: string }): Promise<{ ok: true; group: PotokChild } | PotokError>;

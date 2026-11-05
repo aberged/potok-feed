@@ -18,7 +18,11 @@ const story = (id: number): PotokSubgroup => ({
   app_description: null,
   uses_api: false,
   picture_url: `/avatar/group/${id}`,
+  is_public: true,
+  inherits_members: true,
+  creator_id: 1,
   inserted_at: '2026-11-05T08:00:00Z',
+  published_at: null,
   last_value_at: null,
 });
 

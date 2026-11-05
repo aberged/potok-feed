@@ -42,6 +42,9 @@ const failureScreen = (feed: Feed, state: FeedState) => {
   }
 };
 
+/** A group nobody else was let into yet, shown to who wrote it. See FeedCreator. */
+const isDraft = (story: PotokSubgroup) => !story.is_public && !story.inherits_members;
+
 const storyCard = (feed: Feed, story: PotokSubgroup) => html`
   <article class="feed-card text-base-content" data-story=${story.id}>
     <div class="feed-body">
@@ -60,6 +63,7 @@ const storyCard = (feed: Feed, story: PotokSubgroup) => html`
         <span class="min-w-0 flex-1 truncate text-sm font-medium">
           ${story.description_html ? story.name : nothing}
         </span>
+        ${isDraft(story) ? html`<span class="d-badge d-badge-warning d-badge-sm shrink-0" data-draft>Nacrt</span>` : nothing}
         ${story.uses_api
           ? html`<button
               class="d-btn d-btn-primary d-btn-sm shrink-0"

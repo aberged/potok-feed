@@ -4,8 +4,8 @@ import type { PotokSubgroup } from './potok';
 
 // Dev only (main.ts imports it in its DEV block). Fills what potok-dev.ts
 // reads for `listSubgroups` (localStorage `potok-dev:subgroups`):
-// - `?seed`: 45 stories, with a long one, an app that says what it is and one
-//   without a description;
+// - `?seed`: 45 stories, with a long one, an app that says what it is, a draft
+//   and one without a description;
 // - `?seed=empty`: a `.feed` with no stories;
 // - `?seed=none`: no `.feed`.
 //
@@ -28,11 +28,25 @@ function story(id: number): PotokSubgroup {
     app_description: null,
     uses_api: false,
     picture_url: picture(id),
+    is_public: true,
+    inherits_members: true,
+    creator_id: 1,
     inserted_at: '2026-11-05T08:00:00Z',
+    published_at: null,
     last_value_at: null,
   };
 
   if (id === 44) return { ...shared, name: 'Vest bez opisa', description_html: null };
+  if (id === 42) {
+    return {
+      ...shared,
+      name: 'Nacrt vesti',
+      description_html: `<h1>Nacrt vesti</h1><p>${paragraph}</p>`,
+      is_public: false,
+      inherits_members: false,
+    };
+  }
+
   if (id === 43) {
     return {
       ...shared,

@@ -23,6 +23,7 @@ export type PotokError = {
     | "rate_limited"
     | "invalid_value"
     | "invalid_description"
+    | "invalid_group"
     | "unknown_method"
     /** The call came from an app that is no longer on screen. */
     | "stale_app"
@@ -98,7 +99,10 @@ export type PotokGroupDescription = {
   description_format: PotokContentFormat;
 };
 
-/** A group under a direct sub-group of the app's group; timestamps are ISO 8601 strings. */
+/**
+ * A direct sub-group of the app's group, or a group under one; timestamps are
+ * ISO 8601 strings.
+ */
 export type PotokSubgroup = {
   id: number;
   name: string;
@@ -112,12 +116,54 @@ export type PotokSubgroup = {
   app_description: string | null;
   uses_api: boolean;
   picture_url: string;
+  is_public: boolean;
+  inherits_members: boolean;
+  creator_id: number;
   inserted_at: string;
+  /** When a closed group (private, not inheriting) last opened up; null if it never was closed. */
+  published_at: string | null;
   /** When the newest chat value was posted. */
   last_value_at: string | null;
 };
 
-export type PotokGroupTab = "chat" | "description";
+/** A direct sub-group of the app's group, with what it takes to edit it. */
+export type PotokChild = PotokSubgroup & {
+  /** The source: null when the viewer cannot edit the group, and for an app. */
+  description: string | null;
+  description_format: PotokContentFormat;
+  can_edit: boolean;
+  member_count: number;
+  updated_at: string;
+};
+
+/** What an app may set on a sub-group. A field left out stays as it is. */
+export type PotokChildAttrs = {
+  name?: string;
+  description?: string;
+  descriptionFormat?: PotokContentFormat;
+  isPublic?: boolean;
+  inheritsMembers?: boolean;
+  /** An image URL or a `data:` URL, at most 1,000,000 characters. */
+  picture?: string;
+};
+
+/** The app's own group and what the viewer may do there. */
+export type PotokOwnGroup = {
+  id: number;
+  name: string;
+  is_public: boolean;
+  inherits_members: boolean;
+  /** null for a viewer who cannot see that group. */
+  parent: { id: number; name: string; is_public: boolean; uses_api: boolean } | null;
+  /** The viewer may keep the sub-groups: they hold `edit_group` here. */
+  can_manage_children: boolean;
+  /** They hold `create_subgroups` as well. */
+  can_create_children: boolean;
+  /** Any member can add a group here by hand, past the app. */
+  everyone_creates_subgroups: boolean;
+};
+
+export type PotokGroupTab = "chat" | "description" | "settings";
 
 export type PotokSubgroupListOptions = {
   /** Page size, at most 50 (the server's default is 20). */
@@ -151,11 +197,32 @@ export type PotokSdk = {
     options?: PotokSubgroupListOptions,
   ): Promise<{ ok: true; groups: PotokSubgroup[]; has_more: boolean } | PotokError>;
   /**
-   * Takes the viewer to a group `listSubgroups` can return: to its chat, or with
-   * `tab: "description"` to its description, where a group that is an app runs.
-   * The app ends with the page.
+   * Takes the viewer to this group's parent, a direct sub-group or a group
+   * `listSubgroups` can return: to its chat, with `tab: "description"` to its
+   * description, where a group that is an app runs, or with `tab: "settings"` to
+   * its settings. The app ends with the page.
    */
   openGroup(id: number, options?: { tab?: PotokGroupTab }): Promise<{ ok: true } | PotokError>;
+  getGroup(): Promise<{ ok: true; group: PotokOwnGroup } | PotokError>;
+  /**
+   * The direct sub-groups, in the order of `listSubgroups`. This and the calls
+   * below act in the viewer's name, so they need `can_manage_children`.
+   */
+  listChildren(
+    options?: PotokSubgroupListOptions,
+  ): Promise<{ ok: true; groups: PotokSubgroup[]; has_more: boolean } | PotokError>;
+  getChild(id: number): Promise<{ ok: true; group: PotokChild } | PotokError>;
+  /** Needs `can_create_children`. Without `isPublic` or `inheritsMembers` only the viewer sees the group. */
+  createChild(attrs: PotokChildAttrs & { name: string }): Promise<{ ok: true; group: PotokChild } | PotokError>;
+  /** A closed group that opens up moves to the top of the order. */
+  updateChild(id: number, attrs: PotokChildAttrs): Promise<{ ok: true; group: PotokChild } | PotokError>;
+  /** Closes the group again, and its inherited members leave. Direct members and the viewer stay. */
+  withdrawChild(id: number): Promise<{ ok: true; group: PotokChild } | PotokError>;
+  /** The text as a feed will show it, sanitized on the server; counts as a write for the rate limit. */
+  previewDescription(
+    description: string,
+    options?: { descriptionFormat?: PotokContentFormat },
+  ): Promise<{ ok: true; html: string | null } | PotokError>;
   /**
    * Gets every new value of this app, also the viewer's own; with
    * `{scope: "group"}` also those of the group's other apps. Returns a

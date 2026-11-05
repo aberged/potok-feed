@@ -12,6 +12,7 @@ import type {
   PotokOwnGroup,
   PotokProfile,
   PotokSdk,
+  PotokReaction,
   PotokSubgroup,
   PotokSubgroupListOptions,
   PotokValue,
@@ -131,6 +132,10 @@ function loadSubgroups(): Record<string, PotokSubgroup[]> {
   } catch {
     return {};
   }
+}
+
+function saveSubgroups(subgroups: Record<string, PotokSubgroup[]>) {
+  localStorage.setItem(SUBGROUPS_STORAGE_KEY, JSON.stringify(subgroups));
 }
 
 function loadChildren(): PotokChild[] {
@@ -439,6 +444,38 @@ function createServer(el: HTMLElement) {
       return { ok: true };
     },
 
+    toggleGroupReaction(id: number, emoji: string): { ok: true; reactions: PotokReaction[] } | PotokError {
+      const subgroups = loadSubgroups();
+      const group = Object.values(subgroups)
+        .flat()
+        .find((row) => row.id === id);
+      if (!group) return { ok: false, error: 'not_found' };
+      if (!group.can_react) return forbidden;
+
+      const own = group.reactions.find((reaction) => reaction.emoji === emoji);
+
+      if (!own) group.reactions.push({ emoji, count: 1, mine: true });
+      else if (!own.mine) Object.assign(own, { count: own.count + 1, mine: true });
+      else if (own.count > 1) Object.assign(own, { count: own.count - 1, mine: false });
+      else group.reactions.splice(group.reactions.indexOf(own), 1);
+
+      saveSubgroups(subgroups);
+      return { ok: true, reactions: group.reactions };
+    },
+
+    pickEmoji(): { ok: true; emoji: string } | PotokError {
+      const emoji = window.prompt('[potok-dev] pickEmoji: in potok this is its emoji picker.', '🎉');
+      return emoji ? { ok: true, emoji } : { ok: false, error: 'cancelled' };
+    },
+
+    shareGroup(id: number): { ok: true } | PotokError {
+      const known = Object.values(loadSubgroups()).some((groups) => groups.some((group) => group.id === id));
+      if (!known) return { ok: false, error: 'not_found' };
+
+      console.info(`[potok-dev] shareGroup: in potok the page offers to share /groups/${id}.`);
+      return { ok: true };
+    },
+
     getGroup(): { ok: true; group: PotokOwnGroup } {
       return { ok: true, group: ownGroup };
     },
@@ -492,6 +529,9 @@ function createServer(el: HTMLElement) {
             inserted_at: now,
             published_at: null,
             last_value_at: null,
+            comment_count: 0,
+            reactions: [],
+            can_react: true,
             description: '',
             description_format: 'markdown',
             can_edit: true,
@@ -578,6 +618,18 @@ function createSdk(server: DevServer): PotokSdk {
 
     async openGroup(id, options = {}) {
       return server.openGroup(id, options.tab);
+    },
+
+    async toggleGroupReaction(id, emoji) {
+      return server.toggleGroupReaction(id, emoji);
+    },
+
+    async pickEmoji() {
+      return server.pickEmoji();
+    },
+
+    async shareGroup(id) {
+      return server.shareGroup(id);
     },
 
     async getGroup() {

@@ -1,10 +1,10 @@
 # potok-feed
 
-Potok aplikacija koja simulira news-feed. Jedna grupa je jedna vest, a njen opis je tekst vesti. Svajpom se ide redom kroz vesti, a dugme **Chat** vodi u razgovor o vesti. Vest može da bude i aplikacija, koju pokreće dugme **Otvori**.
+Potok aplikacija koja simulira news-feed. Jedna grupa je jedna vest, a njen opis je tekst vesti. Svajpom se ide redom kroz vesti. Dole su datum objave, reakcije, deljenje i dugme **Komentari**, koje vodi u razgovor o vesti. Vest može da bude i aplikacija, koju pokreće dugme **Otvori**.
 
 Napravljena je po šablonu [potok-vite](../potok-vite/README.md). Aplikacija je jedan fajl, `dist/potok-build.html`, koji se nalepi kao opis grupe sa uključenim „Koristi API“.
 
-Traži `listSubgroups` i `openGroup` iz App API-ja, pa radi tek uz verziju potok-a koja ih ima.
+Traži `listSubgroups`, `openGroup`, `toggleGroupReaction`, `pickEmoji` i `shareGroup` iz App API-ja, pa radi tek uz verziju potok-a koja ih ima.
 
 Radi u paru sa aplikacijom [FeedCreator](../potok-feed-creator/README.md), koja stoji u `.feed` i pravi vesti. Taj par je opisan u `docs/feed-i-feedcreator.md` u projektu potok-ide.
 
@@ -34,8 +34,8 @@ Tačka u imenu `.feed` nema posebno značenje za potok, pa se ta grupa vidi u li
 - Dugačak opis se skroluje unutar kartice, a na kraju teksta sledeći svajp prelazi na sledeću vest.
 - Vesti se učitavaju u stranama od 20. Sledeća strana stiže kad do kraja ostane 5 vesti.
 - Gledalac vidi samo vesti koje vidi i u potok-u: privatnu vest vidi samo njen član. Zato autor među vestima vidi i svoj nacrt, sa oznakom **Nacrt**.
-- Chat otvara razgovor u istoj aplikaciji. Povratak nazad vraća na istu vest. Svako drugo otvaranje kreće od najnovije.
-- Opis stiže prečišćen sa servera. Vest bez opisa prikazuje samo ime i dugme Chat.
+- Komentari otvaraju razgovor u istoj aplikaciji. Povratak nazad vraća na istu vest. Svako drugo otvaranje kreće od najnovije.
+- Opis stiže prečišćen sa servera. Vest bez opisa prikazuje samo ime i dugme Komentari.
 - Vest koja je sama aplikacija prikazuje ime i ono što aplikacija kaže o sebi u `<meta name="description">`. Dugme **Otvori** vodi na stranu te grupe, gde aplikacija radi punim funkcijama, a povratak nazad vraća na istu vest. U samoj kartici se ne pokreće: API je vezan za grupu na ekranu, Feed bi stajao između nje i potok-a, a dodir u aplikaciji bi se sudarao sa svajpom.
 - Aplikacija samo čita. Ne pravi data vrednosti, a vesti se dodaju pravljenjem podgrupa u `.feed`.
 

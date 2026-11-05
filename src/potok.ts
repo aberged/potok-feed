@@ -24,6 +24,9 @@ export type PotokError = {
     | "invalid_value"
     | "invalid_description"
     | "invalid_group"
+    | "invalid_emoji"
+    /** The viewer closed the picker of `pickEmoji`. */
+    | "cancelled"
     | "unknown_method"
     /** The call came from an app that is no longer on screen. */
     | "stale_app"
@@ -99,6 +102,14 @@ export type PotokGroupDescription = {
   description_format: PotokContentFormat;
 };
 
+/** One emoji on a group, whoever used it. */
+export type PotokReaction = {
+  emoji: string;
+  count: number;
+  /** The viewer is among them. */
+  mine: boolean;
+};
+
 /**
  * A direct sub-group of the app's group, or a group under one; timestamps are
  * ISO 8601 strings.
@@ -124,6 +135,12 @@ export type PotokSubgroup = {
   published_at: string | null;
   /** When the newest chat value was posted. */
   last_value_at: string | null;
+  /** The messages in its chat. A thread is a group of its own and does not count. */
+  comment_count: number;
+  /** In the order each emoji was first used. */
+  reactions: PotokReaction[];
+  /** Whether `toggleGroupReaction` works for this viewer: not only for members of a public group. */
+  can_react: boolean;
 };
 
 /** A direct sub-group of the app's group, with what it takes to edit it. */
@@ -203,6 +220,18 @@ export type PotokSdk = {
    * its settings. The app ends with the page.
    */
   openGroup(id: number, options?: { tab?: PotokGroupTab }): Promise<{ ok: true } | PotokError>;
+  /**
+   * Adds the viewer's reaction to a group below this one, or takes it back, as
+   * a click on a reaction does. Counts as a write for the rate limit.
+   */
+  toggleGroupReaction(id: number, emoji: string): Promise<{ ok: true; reactions: PotokReaction[] } | PotokError>;
+  /** Lets the viewer choose any emoji in Potok's own picker; waits for as long as they take. */
+  pickEmoji(): Promise<{ ok: true; emoji: string } | PotokError>;
+  /**
+   * Opens the page's way of sharing with the link of a group `openGroup` can
+   * reach. A frame has neither Web Share nor the clipboard.
+   */
+  shareGroup(id: number): Promise<{ ok: true } | PotokError>;
   getGroup(): Promise<{ ok: true; group: PotokOwnGroup } | PotokError>;
   /**
    * The direct sub-groups, in the order of `listSubgroups`. This and the calls

@@ -4,8 +4,9 @@ import {
   FEED_GROUP,
   LOAD_AHEAD,
   MAX_RETURN_PAGES,
-  OPEN_FAILED_MS,
+  NOTICE_MS,
   PAGE_SIZE,
+  publishedOn,
   RETURN_KEY,
   type FeedState,
 } from './feed';
@@ -24,6 +25,9 @@ const story = (id: number): PotokSubgroup => ({
   inserted_at: '2026-11-05T08:00:00Z',
   published_at: null,
   last_value_at: null,
+  comment_count: 0,
+  reactions: [],
+  can_react: true,
 });
 
 /** A server with stories `count` down to 1, paged like `listSubgroups`. */
@@ -50,19 +54,31 @@ function memoryStorage(items: Record<string, string> = {}) {
   };
 }
 
+const reacted = [{ emoji: '👍', count: 3, mine: true }];
+
 function setup({
   listSubgroups = server(50),
   openGroup = vi.fn(async () => ({ ok: true as const })),
+  toggleGroupReaction = vi.fn(async () => ({ ok: true as const, reactions: reacted })),
+  pickEmoji = vi.fn(async () => ({ ok: true as const, emoji: '🎉' })),
+  shareGroup = vi.fn(async () => ({ ok: true as const })),
   storage = memoryStorage(),
 }: {
   listSubgroups?: PotokSdk['listSubgroups'];
   openGroup?: PotokSdk['openGroup'];
+  toggleGroupReaction?: PotokSdk['toggleGroupReaction'];
+  pickEmoji?: PotokSdk['pickEmoji'];
+  shareGroup?: PotokSdk['shareGroup'];
   storage?: ReturnType<typeof memoryStorage>;
 } = {}) {
   const changes: FeedState[] = [];
-  const feed = createFeed({ listSubgroups, openGroup }, storage, (state) => changes.push(state));
+  const feed = createFeed(
+    { listSubgroups, openGroup, toggleGroupReaction, pickEmoji, shareGroup },
+    storage,
+    (state) => changes.push(state),
+  );
 
-  return { feed, listSubgroups, openGroup, storage, changes };
+  return { feed, listSubgroups, openGroup, toggleGroupReaction, pickEmoji, shareGroup, storage, changes };
 }
 
 describe('the first load', () => {
@@ -172,7 +188,7 @@ describe('leaving a story and coming back', () => {
 
     expect(openGroup).toHaveBeenCalledWith(7, { tab: 'chat' });
     expect(storage.getItem(RETURN_KEY)).toBe('7');
-    expect(feed.state.openFailed).toBe(false);
+    expect(feed.state.notice).toBeNull();
   });
 
   it('opens a story that is an app on its description', async () => {
@@ -193,10 +209,10 @@ describe('leaving a story and coming back', () => {
       await feed.open(7);
 
       expect(storage.getItem(RETURN_KEY)).toBeNull();
-      expect(feed.state.openFailed).toBe(true);
+      expect(feed.state.notice).toBe('open');
 
-      vi.advanceTimersByTime(OPEN_FAILED_MS);
-      expect(feed.state.openFailed).toBe(false);
+      vi.advanceTimersByTime(NOTICE_MS);
+      expect(feed.state.notice).toBeNull();
     } finally {
       vi.useRealTimers();
     }
@@ -251,5 +267,167 @@ describe('leaving a story and coming back', () => {
     await feed.start();
 
     expect(storage.getItem(RETURN_KEY)).toBe('9');
+  });
+});
+
+describe('the date of a story', () => {
+  it('is when it was made', () => {
+    expect(publishedOn({ inserted_at: '2026-11-05T12:00:00Z', published_at: null })).toBe('5. nov 2026.');
+  });
+
+  it('is when it opened up, for a story that stayed closed for a while', () => {
+    expect(publishedOn({ inserted_at: '2026-11-05T12:00:00Z', published_at: '2026-12-24T12:00:00Z' })).toBe(
+      '24. dec 2026.',
+    );
+  });
+});
+
+describe('reacting to a story', () => {
+  it('shows what the server answers, on that story alone', async () => {
+    const { feed, toggleGroupReaction } = setup();
+    await feed.start();
+
+    await feed.react(50, '👍');
+
+    expect(toggleGroupReaction).toHaveBeenCalledWith(50, '👍');
+    expect(feed.state.stories[0].reactions).toEqual(reacted);
+    expect(feed.state.stories[1].reactions).toEqual([]);
+  });
+
+  it('does not take a reaction back with a second tap while the first is on its way', async () => {
+    const { feed, toggleGroupReaction } = setup();
+    await feed.start();
+
+    await Promise.all([feed.react(50, '👍'), feed.react(50, '👍')]);
+
+    expect(toggleGroupReaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('can react to two stories at once, and again afterwards', async () => {
+    const { feed, toggleGroupReaction } = setup();
+    await feed.start();
+
+    await Promise.all([feed.react(50, '👍'), feed.react(49, '👍')]);
+    await feed.react(50, '❤️');
+
+    expect(toggleGroupReaction).toHaveBeenCalledTimes(3);
+  });
+
+  it('says so when it fails, and keeps the reactions', async () => {
+    vi.useFakeTimers();
+
+    try {
+      const { feed } = setup({ toggleGroupReaction: failing('forbidden') });
+      await feed.start();
+
+      await feed.react(50, '👍');
+
+      expect(feed.state.notice).toBe('react');
+      expect(feed.state.stories[0].reactions).toEqual([]);
+
+      vi.advanceTimersByTime(NOTICE_MS);
+      expect(feed.state.notice).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('treats a call with no answer as a failure', async () => {
+    const { feed } = setup({ toggleGroupReaction: () => Promise.reject(new Error('timed out')) });
+    await feed.start();
+
+    await feed.react(50, '👍');
+
+    expect(feed.state.notice).toBe('react');
+  });
+
+  it('reacts with what was chosen in the picker', async () => {
+    const { feed, toggleGroupReaction } = setup();
+    await feed.start();
+
+    await feed.pickReaction(50);
+
+    expect(toggleGroupReaction).toHaveBeenCalledWith(50, '🎉');
+  });
+
+  it('takes a closed picker for no answer, not for a failure', async () => {
+    const { feed, toggleGroupReaction } = setup({ pickEmoji: failing('cancelled') });
+    await feed.start();
+
+    await feed.pickReaction(50);
+
+    expect(toggleGroupReaction).not.toHaveBeenCalled();
+    expect(feed.state.notice).toBeNull();
+  });
+
+  it('says so when the picker cannot open', async () => {
+    const { feed } = setup({ pickEmoji: failing('forbidden') });
+    await feed.start();
+
+    await feed.pickReaction(50);
+
+    expect(feed.state.notice).toBe('react');
+  });
+});
+
+describe('the row of emoji', () => {
+  it('opens and closes on its button, and only one is open', async () => {
+    const { feed } = setup();
+    await feed.start();
+
+    feed.toggleTray(50);
+    expect(feed.state.trayFor).toBe(50);
+
+    feed.toggleTray(49);
+    expect(feed.state.trayFor).toBe(49);
+
+    feed.toggleTray(49);
+    expect(feed.state.trayFor).toBeNull();
+  });
+
+  it('closes when a reaction is chosen and when the picker takes over', async () => {
+    const { feed } = setup();
+    await feed.start();
+
+    feed.toggleTray(50);
+    await feed.react(50, '👍');
+    expect(feed.state.trayFor).toBeNull();
+
+    feed.toggleTray(50);
+    await feed.pickReaction(50);
+    expect(feed.state.trayFor).toBeNull();
+  });
+
+  it('stays with its story and closes when another comes on screen', async () => {
+    const { feed } = setup();
+    await feed.start();
+
+    feed.toggleTray(50);
+    feed.reached(0);
+    expect(feed.state.trayFor).toBe(50);
+
+    feed.reached(1);
+    expect(feed.state.trayFor).toBeNull();
+  });
+});
+
+describe('sharing a story', () => {
+  it('asks the page to do it', async () => {
+    const { feed, shareGroup } = setup();
+    await feed.start();
+
+    await feed.share(50);
+
+    expect(shareGroup).toHaveBeenCalledWith(50);
+    expect(feed.state.notice).toBeNull();
+  });
+
+  it('says so when it cannot', async () => {
+    const { feed } = setup({ shareGroup: failing('not_found') });
+    await feed.start();
+
+    await feed.share(50);
+
+    expect(feed.state.notice).toBe('share');
   });
 });

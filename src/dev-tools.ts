@@ -34,6 +34,16 @@ function story(id: number): PotokSubgroup {
     inserted_at: '2026-11-05T08:00:00Z',
     published_at: null,
     last_value_at: null,
+    comment_count: id % 4 === 0 ? 0 : id * 3,
+    reactions:
+      id % 3 === 0
+        ? []
+        : [
+            { emoji: '👍', count: id, mine: id % 2 === 0 },
+            { emoji: '❤️', count: 2, mine: false },
+          ],
+    // A story here and there is closed to this viewer's reactions.
+    can_react: id % 10 !== 0,
   };
 
   if (id === 44) return { ...shared, name: 'Vest bez opisa', description_html: null };

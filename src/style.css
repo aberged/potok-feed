@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+/* daisyUI components with the `d-` prefix, without themes: the colors come
+   from the potok page's theme (the frame follows its data-theme), and
+   src/dev-theme.css stands in for it in dev. Without the prefix the page's
+   own daisyUI rules would reach the app's elements. */
+@plugin "daisyui" {
+  themes: false;
+  prefix: "d-";
+}
+
+/* The frame loads the page's CSS, which paints the body. The stories sit on
+   the background of the group page instead, like a description in text does. */
+html,
+body {
+  background: transparent;
+}
+
+/* One story per screen, and the browser does the swiping. Mandatory snapping
+   with `stop: always` moves one story at a time however fast the swipe is.
+
+   The body of a card scrolls on its own and has no `overscroll-behavior`, so
+   at the end of a long text the next swipe passes on to the feed. */
+.feed {
+  position: fixed;
+  inset: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scroll-snap-type: y mandatory;
+  scrollbar-width: none;
+}
+
+.feed::-webkit-scrollbar {
+  display: none;
+}
+
+.feed-card {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+
+.feed-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}

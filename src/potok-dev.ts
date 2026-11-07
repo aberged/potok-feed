@@ -10,6 +10,8 @@ import type {
   PotokListedValue,
   PotokListOptions,
   PotokOwnGroup,
+  PotokPoll,
+  PotokPollListOptions,
   PotokProfile,
   PotokSdk,
   PotokReaction,
@@ -35,11 +37,18 @@ import type {
 // The app's own sub-groups (`listChildren`, `createChild`, ...) are in
 // `potok-dev:children`. `potok-dev:group` overrides fields of what `getGroup`
 // answers, for a viewer with other rights or a group set up another way.
+//
+// The polls `listPolls` returns are in `potok-dev:polls`, as `PotokPoll[]`, in
+// what the viewer sees of them. Potok's own form and voting are not here:
+// `openPollForm` adds a poll and `openPoll` votes for the first answer, then
+// both say the poll changed.
 
 const VALUES_STORAGE_KEY = 'potok-dev:values';
 const SUBGROUPS_STORAGE_KEY = 'potok-dev:subgroups';
 const CHILDREN_STORAGE_KEY = 'potok-dev:children';
 const GROUP_STORAGE_KEY = 'potok-dev:group';
+const POLLS_STORAGE_KEY = 'potok-dev:polls';
+const POLL_PAGE_SIZE = 30;
 const LINK_PARAM = 'at';
 const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 200;
@@ -87,6 +96,21 @@ function deliverNewValue(value: PotokValue) {
   });
 
   if (own) window.dispatchEvent(new CustomEvent('phx:new_data_value', { detail: value }));
+}
+
+const pollListeners = new Set<(id: number) => void>();
+
+function loadPolls(): PotokPoll[] {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(POLLS_STORAGE_KEY) || '[]');
+    return Array.isArray(stored) ? stored : [];
+  } catch {
+    return [];
+  }
+}
+
+function savePolls(polls: PotokPoll[]) {
+  localStorage.setItem(POLLS_STORAGE_KEY, JSON.stringify(polls));
 }
 
 function createDescriptionHost(): HTMLElement {
@@ -194,6 +218,7 @@ function loadOwnGroup(): PotokOwnGroup {
     can_manage_children: true,
     can_create_children: true,
     everyone_creates_subgroups: false,
+    can_start_polls: true,
   };
 
   try {
@@ -627,6 +652,84 @@ function createServer(el: HTMLElement) {
 
       return { ok: true, html: devDescriptionHtml(description, format ?? 'markdown') };
     },
+
+    listPolls(options: PotokPollListOptions): { ok: true; polls: PotokPoll[]; has_more: boolean } {
+      const status = options.status ?? 'open';
+
+      const rows = loadPolls()
+        .filter((poll) => (status === 'closed' ? !poll.open : poll.open))
+        .filter((poll) => status !== 'waiting' || (poll.can_vote && !poll.voted))
+        .filter((poll) => options.beforeId === undefined || poll.id < options.beforeId)
+        .sort((a, b) => b.id - a.id);
+
+      return {
+        ok: true,
+        polls: rows.slice(0, POLL_PAGE_SIZE),
+        has_more: rows.length > POLL_PAGE_SIZE,
+      };
+    },
+
+    getPoll(id: number): { ok: true; poll: PotokPoll } | PotokError {
+      const poll = loadPolls().find((row) => row.id === id);
+
+      return poll ? { ok: true, poll } : { ok: false, error: 'not_found' };
+    },
+
+    openPoll(id: number): { ok: true } | PotokError {
+      const polls = loadPolls();
+      const poll = polls.find((row) => row.id === id);
+      if (!poll) return { ok: false, error: 'not_found' };
+
+      if (poll.can_vote && !poll.voted) {
+        poll.voted = true;
+        poll.voters_count += 1;
+        poll.can_see_results = !poll.secret;
+        poll.options[0].mine = !poll.secret;
+        poll.options.forEach((option, index) => {
+          option.votes_count = poll.secret ? null : (option.votes_count ?? 0) + (index === 0 ? 1 : 0);
+        });
+        savePolls(polls);
+        setTimeout(() => pollListeners.forEach((listener) => listener(id)));
+      }
+
+      return { ok: true };
+    },
+
+    openPollForm(): { ok: true } | PotokError {
+      if (!ownGroup.can_start_polls) return forbidden;
+
+      const polls = loadPolls();
+      const id = polls.reduce((max, poll) => Math.max(max, poll.id), 0) + 1;
+
+      polls.push({
+        id,
+        question: `Dev question ${id}`,
+        description: '',
+        kind: 'single',
+        max_choices: null,
+        closes_at: null,
+        closed_at: null,
+        open: true,
+        secret: false,
+        public: false,
+        can_vote: true,
+        voted: false,
+        can_see_results: false,
+        can_see_details: true,
+        can_manage: true,
+        voters_count: 0,
+        outcome: null,
+        winner_option_id: null,
+        options: [
+          { id: id * 100 + 1, text: 'Yes', votes_count: null, mine: false },
+          { id: id * 100 + 2, text: 'No', votes_count: null, mine: false },
+        ],
+      });
+      savePolls(polls);
+      setTimeout(() => pollListeners.forEach((listener) => listener(id)));
+
+      return { ok: true };
+    },
   };
 }
 
@@ -717,6 +820,27 @@ function createSdk(server: DevServer): PotokSdk {
 
     async previewDescription(description, options = {}) {
       return server.previewDescription(description, options.descriptionFormat ?? null);
+    },
+
+    async listPolls(options = {}) {
+      return server.listPolls(options);
+    },
+
+    async getPoll(id) {
+      return server.getPoll(id);
+    },
+
+    async openPoll(id) {
+      return server.openPoll(id);
+    },
+
+    async openPollForm() {
+      return server.openPollForm();
+    },
+
+    onPollChange(listener) {
+      pollListeners.add(listener);
+      return () => pollListeners.delete(listener);
     },
 
     onNewValue(listener, options = {}) {

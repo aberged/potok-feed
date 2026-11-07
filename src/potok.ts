@@ -179,6 +179,8 @@ export type PotokOwnGroup = {
   can_create_children: boolean;
   /** Any member can add a group here by hand, past the app. */
   everyone_creates_subgroups: boolean;
+  /** `openPollForm` works for this viewer. */
+  can_start_polls: boolean;
 };
 
 export type PotokGroupTab = "chat" | "description" | "settings";
@@ -208,6 +210,52 @@ export type PotokSubgroupPage = {
   has_more: boolean;
   /** There are newer groups above these. Only `aroundId` can say so. */
   has_newer: boolean;
+};
+
+/** An answer of a poll. `votes_count` is null while the poll's rules keep it from this viewer. */
+export type PotokPollOption = {
+  id: number;
+  text: string;
+  votes_count: number | null;
+  /** The viewer's ballot holds it. Always false in a secret poll, which keeps no answers. */
+  mine: boolean;
+};
+
+/** A poll of the app's group, as far as its rules show it to this viewer; times are ISO 8601. */
+export type PotokPoll = {
+  id: number;
+  question: string;
+  /** Markdown. */
+  description: string;
+  kind: "single" | "multiple";
+  /** For `multiple`: at most this many answers; null for no limit. */
+  max_choices: number | null;
+  closes_at: string | null;
+  closed_at: string | null;
+  open: boolean;
+  /** Nobody can see who voted for what, and no counts show before the end. */
+  secret: boolean;
+  /** Signed-in non-members vote too. */
+  public: boolean;
+  /** `openPoll` lets the viewer vote now, or change their vote. */
+  can_vote: boolean;
+  voted: boolean;
+  can_see_results: boolean;
+  can_see_details: boolean;
+  /** They may end, change or delete it, on Potok's own page. */
+  can_manage: boolean;
+  voters_count: number;
+  /** What was decided, once the rules show it. */
+  outcome: "passed" | "failed" | "no_quorum" | "tie" | null;
+  winner_option_id: number | null;
+  options: PotokPollOption[];
+};
+
+export type PotokPollListOptions = {
+  /** "waiting" holds those the viewer can still vote in, without paging. */
+  status?: "open" | "closed" | "waiting";
+  /** The id of the last poll of the previous page. */
+  beforeId?: number;
 };
 
 /** `window.potok`. Calls reject if the page does not answer within 10s. */
@@ -281,6 +329,25 @@ export type PotokSdk = {
     description: string,
     options?: { descriptionFormat?: PotokContentFormat },
   ): Promise<{ ok: true; html: string | null } | PotokError>;
+  /** The polls of this group, the newest first, 30 per call. */
+  listPolls(
+    options?: PotokPollListOptions,
+  ): Promise<{ ok: true; polls: PotokPoll[]; has_more: boolean } | PotokError>;
+  getPoll(id: number): Promise<{ ok: true; poll: PotokPoll } | PotokError>;
+  /**
+   * Opens the poll in a dialog of Potok's, over the app, where the viewer votes.
+   * An app cannot vote or change a poll itself: it runs for every viewer, and a
+   * vote can be final.
+   */
+  openPoll(id: number): Promise<{ ok: true } | PotokError>;
+  /** Opens Potok's form for a new poll in this group; needs `can_start_polls`. */
+  openPollForm(): Promise<{ ok: true } | PotokError>;
+  /**
+   * Gets the id of a poll that changed, got a vote or was deleted, a few at a
+   * time. Read it again with `getPoll`; a deleted one is `not_found`. Returns a
+   * function that removes the listener.
+   */
+  onPollChange(listener: (id: number) => void): () => void;
   /**
    * Gets every new value of this app, also the viewer's own; with
    * `{scope: "group"}` also those of the group's other apps. Returns a

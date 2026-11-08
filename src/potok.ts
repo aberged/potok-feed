@@ -9,6 +9,11 @@
 // A group has one app per description: the default one and each alternative
 // description with "Uses API". Each app has its own data values; both APIs
 // see only those of their own app unless asked for the group's (`scope`).
+//
+// Values can also live in collections, under rules the app's editors keep in
+// its config (`getConfig`, `saveConfig`): who writes, who reads everything and
+// who only their own. Those come only through the calls that name a
+// collection, and never through `onNewValue`.
 
 export type PotokContentFormat = "markdown" | "html";
 
@@ -34,8 +39,28 @@ export type PotokError = {
     /** No such sub-group or group, or the viewer cannot see it. */
     | "not_found"
     | "preview"
-    | "disconnected";
+    | "disconnected"
+    /** Collections: the rule takes no more values (closed, or past its deadline). */
+    | "closed"
+    /** `once`: this person has a value there already. */
+    | "already_answered"
+    /** The scores are out, so the value no longer changes. */
+    | "released"
+    | "too_large"
+    | "invalid_collection"
+    /** `saveConfig`: rules that cannot hold; `reason` says which. */
+    | "invalid_rules"
+    | "invalid_files"
+    | "files_missing"
+    | "files_exposed"
+    /** Someone else saved in between; `current` is what is there now. */
+    | "conflict"
+    | "no_config"
+    | "not_scored"
+    | "invalid_summary";
   message?: string;
+  reason?: string;
+  current?: unknown;
 };
 
 /** A data value, as returned by insert and sent to new value listeners. */
@@ -60,6 +85,44 @@ export type PotokListedValue<T extends object = PotokData> = PotokValue<T> & {
   updated_at: string;
 };
 
+/** What Potok adds to a value of a quiz, as far as the viewer may see it. */
+export type PotokManaged = {
+  score?: number;
+  max?: number;
+  /** Answers waiting for an editor. */
+  pending?: number;
+  items: Record<
+    string,
+    {
+      ok?: boolean | null;
+      points?: number | null;
+      /** An editor gave these points. */
+      graded?: boolean;
+      feedback?: string;
+      /** The right answers, once released, when the editors show them. */
+      expected?: Record<string, unknown>;
+    }
+  >;
+};
+
+/**
+ * A value of a collection. `creator_id` and `creator_username` are null on
+ * someone else's anonymous value. Timestamps are ISO 8601 strings.
+ */
+export type PotokCollectionValue<T extends object = PotokData> = Omit<
+  PotokListedValue<T>,
+  "creator_id" | "creator_username"
+> & {
+  creator_id: number | null;
+  creator_username: string | null;
+  collection: string;
+  /** Written while its collection was anonymous. */
+  anonymous: boolean;
+  /** Counts its changes; pass it to `updateValue`. */
+  revision: number;
+  managed: PotokManaged | null;
+};
+
 export type PotokListOptions = {
   /** Page size, at most 200 (the server's default is 50). */
   limit?: number;
@@ -77,6 +140,158 @@ export type PotokListOptions = {
   /** "group" adds the values of the group's other apps that the viewer can open. */
   scope?: "group";
 };
+
+/** A page of a collection: by id, at most 100 values. */
+export type PotokCollectionListOptions = {
+  collection: string;
+  limit?: number;
+  offset?: number;
+  afterId?: number;
+  beforeId?: number;
+  /** "desc" for the newest first. */
+  orderDir?: "asc" | "desc";
+  /** Only the viewer's own values. */
+  mine?: boolean;
+  /** Adds `total`, the count of what the filters keep. */
+  total?: boolean;
+  /** Only values whose data contains this (full readers only). */
+  match?: PotokData;
+};
+
+/** Role keys: "everyone", "admin" or a custom role's UUID (`listRoles`). */
+export type PotokRoleKey = string;
+
+/** A rule of a collection, as the editors write it and Potok keeps it. */
+export type PotokRule = {
+  write?: PotokRoleKey[];
+  read?: PotokRoleKey[];
+  summary?: PotokRoleKey[];
+  once?: boolean;
+  edit_own?: boolean;
+  anonymous?: boolean;
+  public?: boolean;
+  open?: boolean;
+  /** ISO 8601 with a zone. */
+  closes_at?: string | null;
+  /** The path to the map of answers in each value. */
+  under?: string[] | null;
+  uploads?: Record<
+    string,
+    {
+      target: "private" | "public";
+      max_files?: number;
+      max_bytes?: number;
+      types?: ("document" | "presentation" | "spreadsheet" | "drawing" | "pdf" | "image" | "video" | "audio")[];
+    }
+  >;
+  score?: {
+    release?: "immediate" | "manual";
+    released?: boolean;
+    show?: { missed?: boolean; correct?: boolean; points?: boolean };
+  } | null;
+};
+
+/** One check of a quiz's key, by question. */
+export type PotokScoreCheck = { points: number } & (
+  | { eq: unknown }
+  | { set: unknown[] }
+  | { text: string[]; others_wrong?: boolean }
+  | { rows: Record<string, unknown> }
+  | { row_sets: Record<string, unknown[]> }
+  | { manual: true }
+) & { ok?: string; bad?: string };
+
+/** The app's config data: what the app keeps, and the parts Potok reads. */
+export type PotokConfigData = PotokData & {
+  rules?: Record<string, PotokRule>;
+  /** Only editors read it. */
+  secret?: PotokData & { score?: Record<string, Record<string, PotokScoreCheck>> };
+  /** The groups that keep the app's files; written by Potok. */
+  files?: { public?: number; private?: number };
+};
+
+export type PotokConfig = {
+  id: number;
+  revision: number;
+  data: PotokConfigData;
+  updated_at: string;
+};
+
+/** What the viewer may do in a collection. */
+export type PotokCaps = {
+  ruled: boolean;
+  write: boolean;
+  write_block: "closed" | "role" | "blocked" | "members_only" | "not_permitted" | null;
+  read: "all" | "own";
+  summary: boolean;
+  edit_own: boolean;
+  manage: boolean;
+  open: boolean;
+  once: boolean;
+  anonymous: boolean;
+  public: boolean;
+  released: boolean;
+  /** This person has a value there already. */
+  written: boolean;
+  /** The viewer gets a push for each new value. */
+  notify: boolean;
+};
+
+export type PotokConfigReply = {
+  ok: true;
+  config: PotokConfig | null;
+  caps: Record<string, PotokCaps>;
+  /** The viewer edits the app. */
+  manage: boolean;
+  /** They may make its file groups too. */
+  can_create_groups: boolean;
+  /** For editors: whether the file groups stand. */
+  files: { public: "ok" | "missing" | "exposed"; private: "ok" | "missing" | "exposed" } | null;
+  /** The roles an alternative description is limited to; [] for all. */
+  visible_role_keys: PotokRoleKey[];
+  viewer: { signed_in: boolean; member: boolean; profile_id: number | null; username: string | null };
+};
+
+export type PotokRole = { key: PotokRoleKey; name: string; builtin: boolean };
+
+export type PotokSummary = {
+  total: number;
+  keys: Record<
+    string,
+    {
+      answered: number;
+      /** `row` is null for a plain answer, the row's key in a grid. */
+      rows: { row: string | null; answered: number; other: number; buckets: { value: string; count: number }[] }[];
+    }
+  >;
+  score: {
+    count: number;
+    average: number | null;
+    median: number | null;
+    min: number | null;
+    max: number | null;
+    distribution: { score: number; count: number }[];
+    items: Record<string, { ok?: number; bad?: number; pending?: number }>;
+  } | null;
+};
+
+/** A file sent from the frame; put `{file}` into the value. */
+export type PotokUploadedFile = {
+  file: number;
+  name: string;
+  size: number;
+  type: string;
+  /** Only for a picture of the app: an address anyone who sees the app opens. */
+  url?: string;
+};
+
+/** A change in the app's collections the viewer may see. */
+export type PotokValueChange<T extends object = PotokData> =
+  | { event: "created" | "updated"; collection: string; value: PotokCollectionValue<T> }
+  | { event: "deleted"; collection: string; id: number }
+  | { event: "cleared"; collection: string | null }
+  | { event: "regraded"; collection: string }
+  | { event: "config"; collection: "config"; id: number; revision: number };
 
 export type PotokProfile = {
   id: number;
@@ -260,13 +475,75 @@ export type PotokPollListOptions = {
 
 /** `window.potok`. Calls reject if the page does not answer within 10s. */
 export type PotokSdk = {
+  /** Into a collection, as its rule allows. */
+  insertValue<T extends object = PotokData>(
+    data: T | string,
+    options: { collection: string },
+  ): Promise<{ ok: true; value: PotokCollectionValue<T> } | PotokError>;
   insertValue<T extends object = PotokData>(
     data: T | string,
     options?: { contentFormat?: PotokContentFormat },
   ): Promise<{ ok: true; value: PotokValue<T> } | PotokError>;
+  /** A collection: every value for its readers, otherwise the viewer's own. */
+  listValues<T extends object = PotokData>(
+    options: PotokCollectionListOptions,
+  ): Promise<
+    { ok: true; values: PotokCollectionValue<T>[]; has_more: boolean; total: number | null } | PotokError
+  >;
   listValues<T extends object = PotokData>(
     options?: PotokListOptions,
   ): Promise<{ ok: true; values: PotokListedValue<T>[]; has_more: boolean } | PotokError>;
+  /** The config and, per ruled collection, what the viewer may do there. */
+  getConfig(): Promise<PotokConfigReply | PotokError>;
+  /** For editors. Pass the revision you started from (0 for the first save). */
+  saveConfig(
+    data: PotokConfigData,
+    options: { revision: number },
+  ): Promise<{ ok: true; config: PotokConfig } | PotokError>;
+  /** The viewer's own value, where the rule lets authors change theirs. */
+  updateValue<T extends object = PotokData>(
+    id: number,
+    data: T | string,
+    options?: { revision?: number },
+  ): Promise<{ ok: true; value: PotokCollectionValue<T> } | PotokError>;
+  /** For editors: one value of a collection, with its files. */
+  deleteValue(id: number): Promise<{ ok: true; id: number } | PotokError>;
+  /** For editors: a whole collection, with its files. */
+  deleteValues(collection: string): Promise<{ ok: true; count: number } | PotokError>;
+  /** Counts over the answers under `under`, for `keys`; `score` adds a quiz's numbers. */
+  summarizeValues(
+    collection: string,
+    options?: { under?: string[]; keys?: string[]; score?: boolean },
+  ): Promise<{ ok: true; summary: PotokSummary } | PotokError>;
+  /** An editor's points and words; `points: null` gives the answer back to the key. */
+  gradeValue(
+    id: number,
+    items: Record<string, { points?: number | null; feedback?: string }>,
+  ): Promise<{ ok: true; value: PotokCollectionValue } | PotokError>;
+  listRoles(): Promise<{ ok: true; roles: PotokRole[] } | PotokError>;
+  /** The viewer's push for each new value of the collection. */
+  setNotifications(collection: string, on: boolean): Promise<{ ok: true; on: boolean } | PotokError>;
+  /** For editors: makes the app's "Files" and "Private files" groups if missing. */
+  ensureFileGroups(): Promise<{ ok: true; files: { public?: number; private?: number } } | PotokError>;
+  /** An address the frame can show a file by, for ten minutes. */
+  fileUrl(
+    id: number,
+  ): Promise<{ ok: true; url: string; name: string; type: string; size: number } | PotokError>;
+  /** Sends a file for `slot` of `collection`; waits for as long as the upload takes. */
+  uploadFile(
+    file: File | Blob,
+    options: { collection: string; slot: string; onProgress?: (percent: number) => void },
+  ): Promise<{ ok: true; file: PotokUploadedFile } | PotokError>;
+  /** For editors: a picture of the app itself, with an address in `file.url`. */
+  uploadImage(
+    file: File | Blob,
+    options?: { onProgress?: (percent: number) => void },
+  ): Promise<{ ok: true; file: PotokUploadedFile } | PotokError>;
+  /** Changes in the app's collections the viewer may see; returns a remover. */
+  onValues<T extends object = PotokData>(
+    listener: (change: PotokValueChange<T>) => void,
+    options?: { collection?: string },
+  ): () => void;
   updateDescription(
     description: string,
     options?: { descriptionFormat?: PotokContentFormat },

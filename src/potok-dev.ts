@@ -1,7 +1,13 @@
 import type {
   PotokApi,
+  PotokCaps,
   PotokChild,
   PotokChildAttrs,
+  PotokCollectionListOptions,
+  PotokCollectionValue,
+  PotokConfig,
+  PotokConfigData,
+  PotokConfigReply,
   PotokContentFormat,
   PotokData,
   PotokError,
@@ -9,16 +15,23 @@ import type {
   PotokGroupTab,
   PotokListedValue,
   PotokListOptions,
+  PotokManaged,
   PotokOwnGroup,
   PotokPoll,
   PotokPollListOptions,
   PotokProfile,
   PotokSdk,
   PotokReaction,
+  PotokRole,
+  PotokRule,
+  PotokScoreCheck,
   PotokSubgroup,
   PotokSubgroupListOptions,
   PotokSubgroupPage,
+  PotokSummary,
+  PotokUploadedFile,
   PotokValue,
+  PotokValueChange,
 } from './potok';
 
 // Dev stand-in for potok-ide's assets/js/potok_app_sdk.js: the same SDK
@@ -42,6 +55,10 @@ import type {
 // what the viewer sees of them. Potok's own form and voting are not here:
 // `openPollForm` adds a poll and `openPoll` votes for the first answer, then
 // both say the poll changed.
+//
+// Collections (`getConfig`, `insertValue` with a collection, ...) follow the
+// rules of the app's config like the server does, for the viewer `?viewer=`
+// plays: see "Collections and rules" below.
 
 const VALUES_STORAGE_KEY = 'potok-dev:values';
 const SUBGROUPS_STORAGE_KEY = 'potok-dev:subgroups';
@@ -77,7 +94,7 @@ const devProfile: PotokProfile = {
 const appParam = Number(new URLSearchParams(location.search).get('app'));
 const ownDescriptionId = Number.isInteger(appParam) && appParam > 0 ? appParam : null;
 
-const ownValue = (value: PotokValue) => value.description_id === ownDescriptionId;
+const ownValue = (value: { description_id: number | null }) => value.description_id === ownDescriptionId;
 
 // listener -> whether it gets the values of every app in the group.
 const newValueListeners = new Map<(value: PotokValue) => void, boolean>();
@@ -323,6 +340,316 @@ function compareRows(orderBy: string | undefined, orderDir: string | undefined) 
   };
 }
 
+// --- Collections and rules (AppData, ValueRules, ValueScoring, ValueSummary) ---
+//
+// `?viewer=` plays another viewer: `editor` (the default, an admin), `reader`
+// (holds the role "pregled"), `member` (holds "ispitanik"), `outsider` (signed
+// in, not a member) or `guest`. The config of each app is in
+// `potok-dev:config:<app>`, files sent from the frame live until a reload.
+
+const CONFIG_STORAGE_KEY = 'potok-dev:config';
+const NOTIFY_STORAGE_KEY = 'potok-dev:notify';
+const RESERVED_COLLECTIONS = ['config', 'notify', 'files'];
+const MAX_COLLECTION_LIMIT = 100;
+const MAX_VALUE_BYTES = 64 * 1024;
+const MAX_CONFIG_BYTES = 512 * 1024;
+const MAX_BUCKETS = 50;
+
+export const DEV_READER_ROLE = '00000000-0000-4000-8000-000000000001';
+export const DEV_FILLER_ROLE = '00000000-0000-4000-8000-000000000002';
+
+const devRoles: PotokRole[] = [
+  { key: 'admin', name: 'Admin', builtin: true },
+  { key: DEV_READER_ROLE, name: 'pregled', builtin: false },
+  { key: DEV_FILLER_ROLE, name: 'ispitanik', builtin: false },
+  { key: 'everyone', name: 'Svi', builtin: true },
+];
+
+type DevViewer = 'editor' | 'reader' | 'member' | 'outsider' | 'guest';
+
+const viewerParam = new URLSearchParams(location.search).get('viewer');
+const devViewer: DevViewer =
+  viewerParam === 'reader' || viewerParam === 'member' || viewerParam === 'outsider' || viewerParam === 'guest'
+    ? viewerParam
+    : 'editor';
+
+const viewerIds: Record<DevViewer, number | null> = { editor: 1, reader: 2, member: 3, outsider: 4, guest: null };
+const viewerRoleKeys: Record<DevViewer, string[]> = {
+  editor: ['everyone', 'admin'],
+  reader: ['everyone', DEV_READER_ROLE],
+  member: ['everyone', DEV_FILLER_ROLE],
+  outsider: [],
+  guest: [],
+};
+
+const viewerId = viewerIds[devViewer];
+const viewerMember = devViewer === 'editor' || devViewer === 'reader' || devViewer === 'member';
+const viewerManages = devViewer === 'editor';
+const onList = (keys: string[] | undefined) => (keys ?? []).some((key) => viewerRoleKeys[devViewer].includes(key));
+
+type DevRule = Required<Omit<PotokRule, 'closes_at' | 'under' | 'score'>> & {
+  ruled: boolean;
+  closes_at: string | null;
+  under: string[] | null;
+  score: PotokRule['score'];
+};
+
+function devRule(config: PotokConfig | null, collection: string): DevRule {
+  const rule = config?.data.rules?.[collection];
+
+  return {
+    ruled: Boolean(rule),
+    write: rule ? (rule.public ? ['everyone'] : (rule.write ?? ['everyone'])) : ['everyone'],
+    read: rule?.read ?? [],
+    summary: rule?.summary ?? [],
+    once: rule?.once ?? false,
+    edit_own: rule?.edit_own ?? false,
+    anonymous: rule?.anonymous ?? false,
+    public: rule?.public ?? false,
+    open: rule?.open ?? true,
+    closes_at: rule?.closes_at ?? null,
+    under: rule?.under ?? null,
+    uploads: rule?.uploads ?? {},
+    score: rule?.score ?? null,
+  };
+}
+
+const ruleOpen = (rule: DevRule) => rule.open && (!rule.closes_at || Date.now() < Date.parse(rule.closes_at));
+const rulePublic = (rule: DevRule, group: PotokOwnGroup) => rule.public && group.is_public;
+const fullReader = (rule: DevRule) => viewerManages || (viewerMember && onList(rule.read));
+const released = (rule: DevRule) => rule.score?.release === 'immediate' || rule.score?.released === true;
+
+function writeBlock(rule: DevRule, group: PotokOwnGroup): PotokCaps['write_block'] {
+  if (viewerId === null) return 'not_permitted';
+  if (!ruleOpen(rule)) return 'closed';
+  if (viewerMember) return onList(rule.write) ? null : 'role';
+  return rulePublic(rule, group) ? null : 'members_only';
+}
+
+function summaryReader(rule: DevRule, group: PotokOwnGroup): boolean {
+  if (fullReader(rule)) return true;
+  if (viewerMember) return onList(rule.summary);
+  return rulePublic(rule, group) && rule.summary.includes('everyone');
+}
+
+function loadConfig(): PotokConfig | null {
+  try {
+    const stored: unknown = JSON.parse(
+      localStorage.getItem(`${CONFIG_STORAGE_KEY}:${ownDescriptionId ?? 'default'}`) || 'null',
+    );
+    return stored && typeof stored === 'object' ? (stored as PotokConfig) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveConfigData(config: PotokConfig) {
+  localStorage.setItem(`${CONFIG_STORAGE_KEY}:${ownDescriptionId ?? 'default'}`, JSON.stringify(config));
+}
+
+function loadNotify(): string[] {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(NOTIFY_STORAGE_KEY) || '[]');
+    return Array.isArray(stored) ? stored : [];
+  } catch {
+    return [];
+  }
+}
+
+const byteSize = (data: unknown) => new TextEncoder().encode(JSON.stringify(data)).length;
+
+// `data @> match` in Postgres: objects by key, arrays by containment.
+function contains(data: unknown, match: unknown): boolean {
+  if (Array.isArray(match)) {
+    return Array.isArray(data) && match.every((item) => data.some((element) => contains(element, item)));
+  }
+  if (match && typeof match === 'object') {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return false;
+    return Object.entries(match).every(([key, value]) => contains((data as PotokData)[key], value));
+  }
+  return data === match;
+}
+
+function at(data: unknown, path: string[] | null): unknown {
+  if (!path) return undefined;
+  return path.reduce<unknown>(
+    (node, key) => (node && typeof node === 'object' ? (node as PotokData)[key] : undefined),
+    data,
+  );
+}
+
+// ValueScoring: the same checks as on the server.
+const normalizeText = (text: string) => text.trim().toLowerCase().replace(/\s+/g, ' ');
+const checkPoints = (check: PotokScoreCheck) => Math.max(0, Math.min(1000, Math.trunc(check.points || 0)));
+const sameSet = (a: unknown, b: unknown) =>
+  Array.isArray(a) && Array.isArray(b) && a.length > 0 && a.length === new Set(a).size && a.every((x) => b.includes(x)) && b.every((x) => a.includes(x));
+
+function itemMax(check: PotokScoreCheck): number {
+  if ('rows' in check) return checkPoints(check) * Object.keys(check.rows).length;
+  if ('row_sets' in check) return checkPoints(check) * Object.keys(check.row_sets).length;
+  return checkPoints(check);
+}
+
+function checkAnswer(answer: unknown, check: PotokScoreCheck): { ok: boolean | null; points: number | null } {
+  const points = checkPoints(check);
+  const right = (ok: boolean) => ({ ok, points: ok ? points : 0 });
+
+  if ('eq' in check) return right(answer !== undefined && answer !== null && answer === check.eq);
+  if ('set' in check) return right(sameSet(answer, check.set));
+  if ('text' in check) {
+    if (typeof answer !== 'string' || normalizeText(answer) === '') return right(false);
+    if (check.text.map(normalizeText).includes(normalizeText(answer))) return right(true);
+    return check.others_wrong ? right(false) : { ok: null, points: null };
+  }
+  if ('rows' in check || 'row_sets' in check) {
+    const expected = ('rows' in check ? check.rows : check.row_sets) as Record<string, unknown>;
+    const given = answer && typeof answer === 'object' ? (answer as PotokData) : {};
+    const rows = Object.entries(expected);
+    const good = rows.filter(([row, value]) => ('rows' in check ? given[row] === value : sameSet(given[row], value))).length;
+    return { ok: rows.length > 0 && good === rows.length, points: good * points };
+  }
+  return { ok: null, points: null };
+}
+
+function scoreAnswers(answers: unknown, key: Record<string, PotokScoreCheck>, previous: PotokManaged | null): PotokManaged {
+  const given = answers && typeof answers === 'object' ? (answers as PotokData) : {};
+  const items: PotokManaged['items'] = {};
+
+  Object.entries(key).forEach(([question, check]) => {
+    const before = previous?.items[question];
+
+    if (before?.graded) {
+      const points = Math.min(before.points ?? 0, itemMax(check));
+      items[question] = { ok: points >= itemMax(check), points, graded: true, ...(before.feedback ? { feedback: before.feedback } : {}) };
+    } else {
+      items[question] = { ...checkAnswer(given[question], check), ...(before?.feedback ? { feedback: before.feedback } : {}) };
+    }
+  });
+
+  return {
+    score: Object.values(items).reduce((sum, item) => sum + (item.points ?? 0), 0),
+    max: Object.values(key).reduce((sum, check) => sum + itemMax(check), 0),
+    pending: Object.values(items).filter((item) => item.points === null || item.points === undefined).length,
+    items,
+  };
+}
+
+function authorView(managed: PotokManaged, rule: DevRule, key: Record<string, PotokScoreCheck>): PotokManaged {
+  const show = { missed: true, correct: true, points: true, ...(rule.score?.show ?? {}) };
+  const items: PotokManaged['items'] = {};
+
+  Object.entries(managed.items).forEach(([question, item]) => {
+    const check = key[question];
+    const feedback = item.feedback || (item.ok === true ? check?.ok : item.ok === false ? check?.bad : undefined);
+    const expected = check
+      ? Object.fromEntries(Object.entries(check).filter(([name]) => ['eq', 'set', 'text', 'rows', 'row_sets'].includes(name)))
+      : undefined;
+
+    items[question] = {
+      ...(show.missed ? { ok: item.ok } : {}),
+      ...(show.points ? { points: item.points } : {}),
+      ...(show.correct && expected ? { expected } : {}),
+      ...(feedback ? { feedback } : {}),
+    };
+  });
+
+  return show.points ? { score: managed.score, max: managed.max, pending: managed.pending, items } : { items };
+}
+
+const collectionListeners = new Map<(change: PotokValueChange) => void, string | null>();
+
+function deliverChange(change: PotokValueChange) {
+  collectionListeners.forEach((collection, listener) => {
+    if (collection !== null && collection !== change.collection) return;
+
+    try {
+      listener(change);
+    } catch (error) {
+      console.error(error);
+    }
+  });
+}
+
+type DevFile = PotokUploadedFile & { blob: Blob; collection: string | null; slot: string; response: number | null; sender: number | null };
+
+// ValueSummary: buckets by JSON type, the 50 biggest per key and row.
+function summarize(rows: PotokCollectionValue[], under: string[], keys: string[]): PotokSummary['keys'] {
+  const result: PotokSummary['keys'] = {};
+
+  keys.forEach((key) => {
+    const perRow = new Map<string | null, { answered: Set<number>; counts: Map<string, Set<number>> }>();
+    const answered = new Set<number>();
+    const add = (row: string | null, bucket: unknown, id: number) => {
+      if (!['string', 'number', 'boolean'].includes(typeof bucket) || bucket === '') return;
+      const entry = perRow.get(row) ?? { answered: new Set<number>(), counts: new Map<string, Set<number>>() };
+      const text = String(bucket);
+      entry.counts.set(text, (entry.counts.get(text) ?? new Set<number>()).add(id));
+      entry.answered.add(id);
+      perRow.set(row, entry);
+      answered.add(id);
+    };
+    const cell = (row: string | null, value: unknown, id: number) =>
+      Array.isArray(value) ? value.forEach((item) => add(row, item, id)) : add(row, value, id);
+
+    rows.forEach((row) => {
+      const value = (at(row.data, under) as PotokData | undefined)?.[key];
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        Object.entries(value).forEach(([gridRow, gridValue]) => cell(gridRow, gridValue, row.id));
+      } else {
+        cell(null, value, row.id);
+      }
+    });
+
+    if (answered.size === 0) return;
+
+    result[key] = {
+      answered: answered.size,
+      rows: [...perRow.entries()].map(([row, entry]) => {
+        const buckets = [...entry.counts.entries()]
+          .map(([value, ids]) => ({ value, count: ids.size }))
+          .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
+
+        return {
+          row,
+          answered: entry.answered.size,
+          buckets: buckets.slice(0, MAX_BUCKETS),
+          other: buckets.slice(MAX_BUCKETS).reduce((sum, bucket) => sum + bucket.count, 0),
+        };
+      }),
+    };
+  });
+
+  return result;
+}
+
+function scoreStats(rows: PotokCollectionValue[]): PotokSummary['score'] {
+  const scores = rows.map((row) => row.managed?.score).filter((score): score is number => typeof score === 'number').sort((a, b) => a - b);
+  const items: NonNullable<PotokSummary['score']>['items'] = {};
+
+  rows.forEach((row) =>
+    Object.entries(row.managed?.items ?? {}).forEach(([question, item]) => {
+      const status = typeof item.points !== 'number' ? 'pending' : item.ok ? 'ok' : 'bad';
+      items[question] = { ...items[question], [status]: (items[question]?.[status] ?? 0) + 1 };
+    }),
+  );
+
+  const median =
+    scores.length === 0 ? null : scores.length % 2 ? scores[(scores.length - 1) / 2] : (scores[scores.length / 2 - 1] + scores[scores.length / 2]) / 2;
+  const distribution = [...new Set(scores)].map((score) => ({ score, count: scores.filter((s) => s === score).length }));
+
+  return {
+    count: scores.length,
+    average: scores.length ? scores.reduce((sum, score) => sum + score, 0) / scores.length : null,
+    median,
+    min: scores.length ? scores[0] : null,
+    max: scores.length ? scores[scores.length - 1] : null,
+    distribution,
+    items,
+  };
+}
+
+const devFiles = new Map<number, DevFile>();
+
 type DevServer = ReturnType<typeof createServer>;
 
 function createServer(el: HTMLElement) {
@@ -439,6 +766,8 @@ function createServer(el: HTMLElement) {
       syncValues();
       // "group": every app's values (in dev the viewer can open them all).
       const rows = values
+        // Values in collections never reach the calls that name none.
+        .filter((row) => !(row as unknown as { collection?: string }).collection)
         .filter((row) => options.scope === 'group' || ownValue(row))
         .filter((row) => afterId === undefined || row.id > afterId)
         .filter((row) => beforeId === undefined || row.id < beforeId)
@@ -730,24 +1059,491 @@ function createServer(el: HTMLElement) {
 
       return { ok: true };
     },
+
+    // --- Collections ---
+
+    getConfig(): PotokConfigReply | PotokError {
+      const config = loadConfig();
+      const rules = config?.data.rules ?? {};
+      const anyPublic = Object.keys(rules).some((name) => rulePublic(devRule(config, name), ownGroup));
+
+      if (!viewerMember && !anyPublic) {
+        return { ok: false, error: 'not_a_member', message: 'You must be a group member to access group data values.' };
+      }
+
+      syncValues();
+      const caps: Record<string, PotokCaps> = {};
+
+      Object.keys(rules).forEach((name) => {
+        const rule = devRule(config, name);
+        const block = writeBlock(rule, ownGroup);
+
+        caps[name] = {
+          ruled: true,
+          write: block === null,
+          write_block: block,
+          read: fullReader(rule) ? 'all' : 'own',
+          summary: summaryReader(rule, ownGroup),
+          edit_own: rule.edit_own && ruleOpen(rule) && !released(rule),
+          manage: viewerManages,
+          open: ruleOpen(rule),
+          once: rule.once,
+          anonymous: rule.anonymous,
+          public: rulePublic(rule, ownGroup),
+          released: released(rule),
+          written: (values as unknown as PotokCollectionValue[]).some(
+            (row) => row.collection === name && ownValue(row) && row.creator_id === viewerId,
+          ),
+          notify: loadNotify().includes(`${viewerId}:${name}`),
+        };
+      });
+
+      const files = config?.data.files ?? {};
+
+      return {
+        ok: true,
+        config:
+          config && !viewerManages
+            ? { ...config, data: Object.fromEntries(Object.entries(config.data).filter(([key]) => key !== 'secret')) }
+            : config,
+        caps,
+        manage: viewerManages,
+        can_create_groups: viewerManages,
+        files: viewerManages
+          ? { public: files.public ? 'ok' : 'missing', private: files.private ? 'ok' : 'missing' }
+          : null,
+        visible_role_keys: [],
+        viewer: {
+          signed_in: viewerId !== null,
+          member: viewerMember,
+          profile_id: viewerId,
+          username: viewerId === null ? null : `dev-${devViewer}`,
+        },
+      };
+    },
+
+    saveConfig(data: PotokConfigData, revision: number | null): { ok: true; config: PotokConfig } | PotokError {
+      if (!viewerManages) return forbidden;
+      if (byteSize(data) > MAX_CONFIG_BYTES) return { ok: false, error: 'too_large', message: 'That is too much to save.' };
+
+      const current = loadConfig();
+      if ((current?.revision ?? 0) !== (revision ?? -1) && !(current === null && (revision ?? 0) === 0)) {
+        return { ok: false, error: 'conflict', current };
+      }
+
+      const config: PotokConfig = {
+        id: current?.id ?? 900_000 + (ownDescriptionId ?? 0),
+        revision: current ? current.revision + 1 : 0,
+        data: { ...data, files: current?.data.files ?? {} },
+        updated_at: timestamp(),
+      };
+
+      saveConfigData(config);
+      setTimeout(() => deliverChange({ event: 'config', collection: 'config', id: config.id, revision: config.revision }));
+      return { ok: true, config };
+    },
+
+    insertCollectionValue(collection: string, data: string): { ok: true; value: PotokCollectionValue } | PotokError {
+      if (RESERVED_COLLECTIONS.includes(collection) || !/^[a-z][a-z0-9_-]{0,39}$/.test(collection)) {
+        return { ok: false, error: 'invalid_collection' };
+      }
+
+      const decoded = decodeData(data);
+      if (!decoded) return { ok: false, error: 'invalid_value', message: 'Could not save the data value.' };
+      if (byteSize(decoded) > MAX_VALUE_BYTES) return { ok: false, error: 'too_large', message: 'That is too much to save.' };
+
+      const config = loadConfig();
+      const rule = devRule(config, collection);
+      const block = writeBlock(rule, ownGroup);
+
+      if (block === 'closed') return { ok: false, error: 'closed', message: 'This no longer takes answers.' };
+      if (block === 'members_only') return { ok: false, error: 'not_a_member', message: 'You must be a group member to access group data values.' };
+      if (block) return forbidden;
+
+      syncValues();
+
+      const rows = values as unknown as PotokCollectionValue[];
+
+      if (rule.once && rows.some((row) => row.collection === collection && ownValue(row) && row.creator_id === viewerId)) {
+        return { ok: false, error: 'already_answered', message: 'You have already answered.' };
+      }
+
+      const now = timestamp();
+      const key = config?.data.secret?.score?.[collection] ?? {};
+      const row = {
+        id: values.reduce((max, v) => Math.max(max, v.id), 0) + 1,
+        content: 'data:',
+        data: decoded,
+        content_format: 'markdown' as PotokContentFormat,
+        is_data: true,
+        group_id: 1,
+        parent_id: null,
+        creator_id: viewerId ?? 0,
+        creator_username: `dev-${devViewer}`,
+        description_id: ownDescriptionId,
+        collection,
+        anonymous: rule.anonymous,
+        revision: 0,
+        managed: rule.score && rule.under ? scoreAnswers(at(decoded, rule.under), key, null) : null,
+        inserted_at: now,
+        updated_at: now,
+      };
+
+      values.push(row as unknown as PotokListedValue);
+      saveValues(values);
+      this.claimFiles(rule, decoded, row.id);
+
+      const value = this.present(row as PotokCollectionValue, rule, key);
+      setTimeout(() => deliverChange({ event: 'created', collection, value }));
+      return { ok: true, value };
+    },
+
+    present(row: PotokCollectionValue, rule: DevRule, key: Record<string, PotokScoreCheck>): PotokCollectionValue {
+      const own = row.creator_id === viewerId;
+      const author = row.anonymous && !own ? { creator_id: null, creator_username: null } : {};
+      const managed = !row.managed
+        ? null
+        : fullReader(rule)
+          ? row.managed
+          : own && released(rule)
+            ? authorView(row.managed, rule, key)
+            : null;
+
+      return { ...row, ...author, managed };
+    },
+
+    listCollection(
+      options: PotokCollectionListOptions,
+    ): { ok: true; values: PotokCollectionValue[]; has_more: boolean; total: number | null } | PotokError {
+      const config = loadConfig();
+      const rule = devRule(config, options.collection);
+      const full = fullReader(rule);
+
+      if (viewerId === null) return forbidden;
+      if (!full && !viewerMember && !rulePublic(rule, ownGroup)) {
+        return { ok: false, error: 'not_a_member', message: 'You must be a group member to access group data values.' };
+      }
+
+      syncValues();
+      const limit = Math.max(1, Math.min(nonNegativeInteger(options.limit) ?? DEFAULT_LIST_LIMIT, MAX_COLLECTION_LIMIT));
+      const offset = nonNegativeInteger(options.offset) ?? 0;
+      const key = config?.data.secret?.score?.[options.collection] ?? {};
+
+      const kept = (values as unknown as PotokCollectionValue[])
+        .filter((row) => row.collection === options.collection && ownValue(row))
+        .filter((row) => !(options.mine || !full) || row.creator_id === viewerId)
+        .filter((row) => !full || !options.match || contains(row.data, options.match));
+
+      const rows = kept
+        .filter((row) => options.afterId === undefined || row.id > options.afterId)
+        .filter((row) => options.beforeId === undefined || row.id < options.beforeId)
+        .sort((a, b) => (options.orderDir === 'desc' ? b.id - a.id : a.id - b.id))
+        .slice(offset, offset + limit + 1);
+
+      return {
+        ok: true,
+        values: rows.slice(0, limit).map((row) => this.present(row, rule, key)),
+        has_more: rows.length > limit,
+        total: options.total ? kept.length : null,
+      };
+    },
+
+    updateCollectionValue(id: number, data: string, revision: number | null): { ok: true; value: PotokCollectionValue } | PotokError {
+      syncValues();
+      const row = (values as unknown as PotokCollectionValue[]).find(
+        (value) => value.id === id && value.collection && !RESERVED_COLLECTIONS.includes(value.collection) && ownValue(value),
+      );
+      if (!row) return { ok: false, error: 'not_found' };
+
+      const config = loadConfig();
+      const rule = devRule(config, row.collection);
+      const decoded = decodeData(data);
+
+      if (row.creator_id !== viewerId || !rule.edit_own) return forbidden;
+      if (!ruleOpen(rule)) return { ok: false, error: 'closed', message: 'This no longer takes answers.' };
+      if (released(rule)) return { ok: false, error: 'released', message: 'The scores are out, so the answer can no longer change.' };
+      if (revision !== null && revision !== row.revision) return { ok: false, error: 'conflict', current: row };
+      if (!decoded) return { ok: false, error: 'invalid_value', message: 'Could not save the data value.' };
+
+      const key = config?.data.secret?.score?.[row.collection] ?? {};
+      Object.assign(row, {
+        data: decoded,
+        revision: row.revision + 1,
+        updated_at: timestamp(),
+        managed: rule.score && rule.under ? scoreAnswers(at(decoded, rule.under), key, row.managed) : row.managed,
+      });
+      saveValues(values);
+      this.claimFiles(rule, decoded, row.id);
+
+      const value = this.present(row, rule, key);
+      setTimeout(() => deliverChange({ event: 'updated', collection: row.collection, value }));
+      return { ok: true, value };
+    },
+
+    deleteCollectionValue(id: number): { ok: true; id: number } | PotokError {
+      if (!viewerManages) return forbidden;
+
+      syncValues();
+      const index = values.findIndex(
+        (row) => row.id === id && (row as unknown as PotokCollectionValue).collection && ownValue(row),
+      );
+      if (index < 0) return { ok: false, error: 'not_found' };
+
+      const [row] = values.splice(index, 1) as unknown as PotokCollectionValue[];
+      saveValues(values);
+      setTimeout(() => deliverChange({ event: 'deleted', collection: row.collection, id }));
+      return { ok: true, id };
+    },
+
+    deleteCollection(collection: string): { ok: true; count: number } | PotokError {
+      if (!viewerManages) return forbidden;
+
+      syncValues();
+      const before = values.length;
+      const left = values.filter(
+        (row) => !((row as unknown as PotokCollectionValue).collection === collection && ownValue(row)),
+      );
+      values.splice(0, values.length, ...left);
+      saveValues(values);
+      setTimeout(() => deliverChange({ event: 'cleared', collection }));
+      return { ok: true, count: before - left.length };
+    },
+
+    summarizeCollection(
+      collection: string,
+      options: { under?: string[] | null; keys?: string[]; score?: boolean },
+    ): { ok: true; summary: PotokSummary } | PotokError {
+      const config = loadConfig();
+      const rule = devRule(config, collection);
+      if (!summaryReader(rule, ownGroup)) return forbidden;
+
+      const under = options.under ?? rule.under;
+      if (!under) return { ok: false, error: 'invalid_summary' };
+
+      syncValues();
+      const rows = (values as unknown as PotokCollectionValue[]).filter((row) => row.collection === collection && ownValue(row));
+
+      return {
+        ok: true,
+        summary: {
+          total: rows.length,
+          keys: summarize(rows, under, options.keys ?? []),
+          score: options.score && fullReader(rule) ? scoreStats(rows) : null,
+        },
+      };
+    },
+
+    gradeCollectionValue(
+      id: number,
+      items: Record<string, { points?: number | null; feedback?: string }>,
+    ): { ok: true; value: PotokCollectionValue } | PotokError {
+      if (!viewerManages) return forbidden;
+
+      syncValues();
+      const row = (values as unknown as PotokCollectionValue[]).find((value) => value.id === id && ownValue(value));
+      if (!row) return { ok: false, error: 'not_found' };
+
+      const config = loadConfig();
+      const rule = devRule(config, row.collection);
+      const key = config?.data.secret?.score?.[row.collection] ?? {};
+      if (!rule.score || !rule.under) return { ok: false, error: 'not_scored' };
+
+      const managed = scoreAnswers(at(row.data, rule.under), key, row.managed);
+
+      Object.entries(items).forEach(([question, grade]) => {
+        const check = key[question];
+        const item = managed.items[question];
+        if (!check || !item) return;
+
+        if (typeof grade.feedback === 'string') item.feedback = grade.feedback.trim() || undefined;
+        if (typeof grade.points === 'number') {
+          const points = Math.max(0, Math.min(Math.trunc(grade.points), itemMax(check)));
+          Object.assign(item, { points, ok: points >= itemMax(check), graded: true });
+        } else if (grade.points === null) {
+          delete item.graded;
+          Object.assign(item, checkAnswer(at(row.data, [...rule.under!, question]), check));
+        }
+      });
+
+      const regraded = scoreAnswers(at(row.data, rule.under), key, managed);
+      row.managed = regraded;
+      saveValues(values);
+
+      const value = this.present(row, rule, key);
+      setTimeout(() => deliverChange({ event: 'updated', collection: row.collection, value }));
+      return { ok: true, value };
+    },
+
+    listRoles(): { ok: true; roles: PotokRole[] } | PotokError {
+      return viewerMember ? { ok: true, roles: devRoles } : { ok: false, error: 'not_a_member' };
+    },
+
+    setNotifications(collection: string, on: boolean): { ok: true; on: boolean } | PotokError {
+      if (!fullReader(devRule(loadConfig(), collection))) return forbidden;
+
+      const entry = `${viewerId}:${collection}`;
+      const subscribed = loadNotify().filter((item) => item !== entry);
+      localStorage.setItem(NOTIFY_STORAGE_KEY, JSON.stringify(on ? [...subscribed, entry] : subscribed));
+      console.info(`[potok-dev] setNotifications: in potok each new value of ${collection} pushes to this viewer.`);
+      return { ok: true, on };
+    },
+
+    ensureFileGroups(): { ok: true; files: { public?: number; private?: number } } | PotokError {
+      if (!viewerManages) return forbidden;
+
+      const config = loadConfig();
+      if (!config) return { ok: false, error: 'no_config' };
+
+      const files = { public: config.data.files?.public ?? 801, private: config.data.files?.private ?? 802 };
+      saveConfigData({ ...config, data: { ...config.data, files } });
+      return { ok: true, files };
+    },
+
+    async sendFile(
+      file: File | Blob,
+      collection: string | null,
+      slot: string,
+      onProgress?: (percent: number) => void,
+    ): Promise<{ ok: true; file: PotokUploadedFile } | PotokError> {
+      const config = loadConfig();
+      const name = file instanceof File ? file.name : 'file';
+
+      if (collection === null) {
+        if (!viewerManages) return forbidden;
+        if (!file.type.startsWith('image/') || file.size > 10 * 1024 * 1024) return { ok: false, error: 'invalid_files' };
+      } else {
+        const rule = devRule(config, collection);
+        const spec = rule.uploads[slot];
+        if (writeBlock(rule, ownGroup)) return forbidden;
+        if (!spec || file.size > (spec.max_bytes ?? 10 * 1024 * 1024)) {
+          return { ok: false, error: 'invalid_files', message: 'A file is missing or does not fit.' };
+        }
+      }
+
+      if (!config?.data.files?.[collection === null ? 'public' : (config.data.rules?.[collection]?.uploads?.[slot]?.target ?? 'private')]) {
+        return { ok: false, error: 'files_missing', message: 'The group that keeps the files is gone.' };
+      }
+
+      [25, 60, 100].forEach((percent, index) => setTimeout(() => onProgress?.(percent), 80 * (index + 1)));
+      await new Promise((resolve) => setTimeout(resolve, 300));
+
+      const id = Math.max(700_000, ...devFiles.keys()) + 1;
+      const url =
+        collection === null
+          ? await new Promise<string>((resolve) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(String(reader.result));
+              reader.readAsDataURL(file);
+            })
+          : undefined;
+
+      const sent: DevFile = { file: id, name, size: file.size, type: file.type, blob: file, collection, slot, response: null, sender: viewerId };
+      devFiles.set(id, sent);
+
+      return { ok: true, file: { file: id, name, size: file.size, type: file.type, ...(url ? { url } : {}) } };
+    },
+
+    claimFiles(rule: DevRule, data: PotokData, responseId: number) {
+      Object.keys(rule.uploads).forEach((slot) => {
+        const refs = at(data, [...(rule.under ?? []), slot]);
+        if (!Array.isArray(refs)) return;
+
+        refs.forEach((ref: { file?: number }) => {
+          const sent = typeof ref?.file === 'number' ? devFiles.get(ref.file) : undefined;
+          if (sent && sent.sender === viewerId && (sent.response === null || sent.response === responseId)) {
+            sent.response = responseId;
+          }
+        });
+      });
+    },
+
+    fileUrl(id: number): { ok: true; url: string; name: string; type: string; size: number } | PotokError {
+      const sent = devFiles.get(id);
+      if (!sent) return { ok: false, error: 'not_found' };
+
+      return { ok: true, url: URL.createObjectURL(sent.blob), name: sent.name, type: sent.type, size: sent.size };
+    },
   };
 }
 
 function createSdk(server: DevServer): PotokSdk {
   return {
-    async insertValue<T extends object = PotokData>(
-      data: T | string,
-      options: { contentFormat?: PotokContentFormat } = {},
-    ) {
-      const reply = server.insertValue({
-        data: typeof data === 'string' ? data : JSON.stringify(data ?? {}),
-        content_format: options.contentFormat || 'markdown',
-      });
-      return reply as { ok: true; value: PotokValue<T> } | PotokError;
+    insertValue: (async (
+      data: unknown,
+      options: { contentFormat?: PotokContentFormat; collection?: string } = {},
+    ) => {
+      const encoded = typeof data === 'string' ? data : JSON.stringify(data ?? {});
+      if (options.collection) return server.insertCollectionValue(options.collection, encoded);
+
+      return server.insertValue({ data: encoded, content_format: options.contentFormat || 'markdown' });
+    }) as PotokSdk['insertValue'],
+
+    listValues: (async (options: PotokListOptions | PotokCollectionListOptions = {}) =>
+      'collection' in options && options.collection
+        ? server.listCollection(options as PotokCollectionListOptions)
+        : server.listValues(options as PotokListOptions)) as PotokSdk['listValues'],
+
+    async getConfig() {
+      return server.getConfig();
     },
 
-    async listValues<T extends object = PotokData>(options: PotokListOptions = {}) {
-      return server.listValues(options) as { ok: true; values: PotokListedValue<T>[]; has_more: boolean };
+    async saveConfig(data, options) {
+      return server.saveConfig(data, options?.revision ?? null);
+    },
+
+    updateValue: (async (id: number, data: unknown, options: { revision?: number } = {}) =>
+      server.updateCollectionValue(
+        id,
+        typeof data === 'string' ? data : JSON.stringify(data ?? {}),
+        options.revision ?? null,
+      )) as PotokSdk['updateValue'],
+
+    async deleteValue(id) {
+      return server.deleteCollectionValue(id);
+    },
+
+    async deleteValues(collection) {
+      return server.deleteCollection(collection);
+    },
+
+    async summarizeValues(collection, options = {}) {
+      return server.summarizeCollection(collection, options);
+    },
+
+    async gradeValue(id, items) {
+      return server.gradeCollectionValue(id, items);
+    },
+
+    async listRoles() {
+      return server.listRoles();
+    },
+
+    async setNotifications(collection, on) {
+      return server.setNotifications(collection, on === true);
+    },
+
+    async ensureFileGroups() {
+      return server.ensureFileGroups();
+    },
+
+    async fileUrl(id) {
+      return server.fileUrl(id);
+    },
+
+    uploadFile(file, options) {
+      return server.sendFile(file, options.collection, options.slot, options.onProgress);
+    },
+
+    uploadImage(file, options = {}) {
+      return server.sendFile(file, null, '_image', options.onProgress);
+    },
+
+    onValues(listener, options = {}) {
+      if (typeof listener !== 'function') return () => {};
+
+      const added = listener as (change: PotokValueChange) => void;
+      collectionListeners.set(added, options.collection ?? null);
+      return () => collectionListeners.delete(added);
     },
 
     async updateDescription(description, options = {}) {

@@ -42,8 +42,9 @@ function licenseComment(source: string | Uint8Array): string {
   const entries = packages.map(({ name, version, identifier, text }) =>
     [`${name} ${version}${identifier ? ` (${identifier})` : ''}`, text].filter(Boolean).join('\n\n'),
   );
-  // A `*/` inside a license text would close the comment early.
-  const body = entries.join('\n\n\n').replace(/\*\//g, '* /');
+  // A `*/` inside a license text would close the comment early, and some
+  // packages ship their license with CRLF line ends.
+  const body = entries.join('\n\n\n').replace(/\r\n?/g, '\n').replace(/\*\//g, '* /');
   return `/*! The packages bundled into this app and their licenses:\n\n${body}\n*/`;
 }
 

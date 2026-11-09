@@ -18,7 +18,10 @@ import type {
   PotokListedValue,
   PotokListOptions,
   PotokManaged,
+  PotokMapConfig,
   PotokOwnGroup,
+  PotokPlace,
+  PotokPlaceAttrs,
   PotokPoll,
   PotokPollListOptions,
   PotokProfile,
@@ -58,6 +61,11 @@ import type {
 // `openPollForm` adds a poll and `openPoll` votes for the first answer, then
 // both say the poll changed.
 //
+// A map's places (`listPlaces`, `createPlace`) are in `potok-dev:places`, as
+// `PotokPlace[]`, and what `getMapConfig` answers in `potok-dev:map-config`:
+// a map app seeds both in dev. `showGroup` only says what Potok would open,
+// then says it closed.
+//
 // Collections (`getConfig`, `insertValue` with a collection, ...) follow the
 // rules of the app's config like the server does, for the viewer `?viewer=`
 // plays: see "Collections and rules" below.
@@ -67,6 +75,8 @@ const SUBGROUPS_STORAGE_KEY = 'potok-dev:subgroups';
 const CHILDREN_STORAGE_KEY = 'potok-dev:children';
 const GROUP_STORAGE_KEY = 'potok-dev:group';
 const POLLS_STORAGE_KEY = 'potok-dev:polls';
+const PLACES_STORAGE_KEY = 'potok-dev:places';
+const MAP_CONFIG_STORAGE_KEY = 'potok-dev:map-config';
 const POLL_PAGE_SIZE = 30;
 const LINK_PARAM = 'at';
 const DEFAULT_LIST_LIMIT = 50;
@@ -118,6 +128,44 @@ function deliverNewValue(value: PotokValue) {
 }
 
 const pollListeners = new Set<(id: number) => void>();
+const subgroupListeners = new Set<() => void>();
+const sheetListeners = new Set<(id: number) => void>();
+
+function loadPlaces(): PotokPlace[] {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(PLACES_STORAGE_KEY) || '[]');
+    return Array.isArray(stored) ? stored : [];
+  } catch {
+    return [];
+  }
+}
+
+// Without a seeded config, OpenStreetMap's tiles straight from the browser
+// (in potok they come through the page) and no pins to draw.
+function loadMapConfig(): PotokMapConfig {
+  const fallback: PotokMapConfig = {
+    tiles: {
+      url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      max_zoom: 19,
+    },
+    default_bounds: [
+      [41.85, 18.82],
+      [46.19, 23.01],
+    ],
+    pins: { drop: '', glyph_transform: '', tones: {}, kinds: [], icons: [] },
+    place_kinds: [],
+    can_create_places: true,
+    can_edit_view: true,
+  };
+
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(MAP_CONFIG_STORAGE_KEY) || 'null');
+    return stored && typeof stored === 'object' ? { ...fallback, ...(stored as Partial<PotokMapConfig>) } : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function loadPolls(): PotokPoll[] {
   try {
@@ -1214,6 +1262,62 @@ function createServer(el: HTMLElement) {
       return { ok: true };
     },
 
+    // --- Maps ---
+
+    mapConfig(): { ok: true } & PotokMapConfig {
+      return { ok: true, ...loadMapConfig() };
+    },
+
+    listPlaces(): { ok: true; places: PotokPlace[]; truncated: boolean } {
+      return { ok: true, places: loadPlaces(), truncated: false };
+    },
+
+    createPlace(attrs: PotokPlaceAttrs): { ok: true; place: PotokPlace } | PotokError {
+      const config = loadMapConfig();
+      if (!config.can_create_places) return forbidden;
+
+      const name = typeof attrs.name === 'string' ? attrs.name.trim() : '';
+      const kinds = config.place_kinds.map((kind) => kind.key);
+      const valid =
+        name !== '' &&
+        (kinds.length === 0 || kinds.includes(attrs.kind)) &&
+        typeof attrs.lat === 'number' &&
+        Math.abs(attrs.lat) <= 90 &&
+        typeof attrs.lng === 'number' &&
+        Math.abs(attrs.lng) <= 180;
+
+      if (!valid) return { ok: false, error: 'invalid_place', message: 'Could not save the group.' };
+
+      const places = loadPlaces();
+      const place: PotokPlace = {
+        id: places.reduce((max, row) => Math.max(max, row.id), 0) + 1,
+        name,
+        lat: attrs.lat,
+        lng: attrs.lng,
+        kind: attrs.kind,
+        pin: attrs.pin ?? null,
+        picture_url: null,
+        is_public: attrs.isPublic ?? false,
+      };
+
+      localStorage.setItem(PLACES_STORAGE_KEY, JSON.stringify([...places, place]));
+      setTimeout(() => subgroupListeners.forEach((listener) => listener()));
+
+      return { ok: true, place };
+    },
+
+    showGroup(id: number): { ok: true } | PotokError {
+      const place = loadPlaces().find((row) => row.id === id);
+      if (!place) return { ok: false, error: 'not_found' };
+
+      setTimeout(() => {
+        window.alert(`[potok-dev] showGroup: in potok the page opens the description of "${place.name}" over the app.`);
+        sheetListeners.forEach((listener) => listener(id));
+      });
+
+      return { ok: true };
+    },
+
     // --- Collections ---
 
     getConfig(): PotokConfigReply | PotokError {
@@ -1803,6 +1907,36 @@ function createSdk(server: DevServer): PotokSdk {
       const added = listener as (value: PotokValue) => void;
       newValueListeners.set(added, options.scope === 'group');
       return () => newValueListeners.delete(added);
+    },
+
+    async getMapConfig() {
+      return server.mapConfig();
+    },
+
+    async listPlaces() {
+      return server.listPlaces();
+    },
+
+    async createPlace(attrs) {
+      return server.createPlace(attrs);
+    },
+
+    async showGroup(id) {
+      return server.showGroup(id);
+    },
+
+    onGroupSheetClose(listener) {
+      if (typeof listener !== 'function') return () => {};
+
+      sheetListeners.add(listener);
+      return () => sheetListeners.delete(listener);
+    },
+
+    onSubgroupsChange(listener) {
+      if (typeof listener !== 'function') return () => {};
+
+      subgroupListeners.add(listener);
+      return () => subgroupListeners.delete(listener);
     },
   };
 }

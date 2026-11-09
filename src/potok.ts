@@ -29,6 +29,10 @@ export type PotokError = {
     | "invalid_value"
     | "invalid_description"
     | "invalid_group"
+    /** `createPlace`: a name, kind, place or pin it does not take. */
+    | "invalid_place"
+    /** `showGroup` from inside what `showGroup` opened. */
+    | "unavailable"
     | "invalid_emoji"
     | "invalid_date"
     /** The viewer closed the picker of `pickEmoji`. */
@@ -446,6 +450,72 @@ export type PotokOwnGroup = {
 
 export type PotokGroupTab = "chat" | "description" | "settings";
 
+/** One path of a pin's glyph (24 x 24 Heroicons, solid). */
+export type PotokPinPath = { d: string; evenodd: boolean };
+
+/** How a kind of group or a chosen icon looks on a map. */
+export type PotokPinLook = {
+  key: string;
+  /** Its name in the viewer's language. */
+  title: string;
+  /** A key of `tones`. */
+  tone: string;
+  paths: PotokPinPath[];
+};
+
+/** What a map needs before its first pin (`getMapConfig`). */
+export type PotokMapConfig = {
+  /** Tiles come through Potok: `url` has `{z}`, `{x}` and `{y}`; `attribution` is HTML to show. */
+  tiles: { url: string; attribution: string; max_zoom: number };
+  /** `[[south, west], [north, east]]`: where a map opens until its editors save a view. */
+  default_bounds: [[number, number], [number, number]];
+  pins: {
+    /** The drop on a 32 x 40 box, as an SVG path, its point at (16, 39). */
+    drop: string;
+    /** Where the glyph goes in the drop, as an SVG transform. */
+    glyph_transform: string;
+    /** The colour of each tone, as `#rrggbb`; a white glyph reads on every one. */
+    tones: Record<string, string>;
+    /** What a group shows by its kind: its preset, "app" or "none". */
+    kinds: PotokPinLook[];
+    /** What a group can pick instead, in the order of its settings. */
+    icons: PotokPinLook[];
+  };
+  /** The kinds `createPlace` takes, in the order of Potok's "Create sub-group" menu. */
+  place_kinds: { key: string; title: string }[];
+  /** `createPlace` works for this viewer: a member who may make sub-groups here. */
+  can_create_places: boolean;
+  /** The viewer may edit this group, so may save the map's view in its config. */
+  can_edit_view: boolean;
+};
+
+/** A sub-group right under the app's group that has a place on a map. */
+export type PotokPlace = {
+  id: number;
+  name: string;
+  lat: number;
+  lng: number;
+  /** A key of `pins.kinds`. */
+  kind: string;
+  /** A key of `pins.icons`, "picture" for the group's picture, null for its kind's. */
+  pin: string | null;
+  picture_url: string | null;
+  is_public: boolean;
+};
+
+/** A new place: a sub-group from a preset, as Potok's menu makes it, standing at `lat`, `lng`. */
+export type PotokPlaceAttrs = {
+  name: string;
+  /** A key of `place_kinds`. */
+  kind: string;
+  lat: number;
+  lng: number;
+  /** Left out, the preset's default under this group. */
+  isPublic?: boolean;
+  /** A key of `pins.icons` or "picture"; left out, the kind's. */
+  pin?: string;
+};
+
 export type PotokSubgroupListOptions = {
   /** Page size, at most 50 (the server's default is 20). */
   limit?: number;
@@ -684,6 +754,26 @@ export type PotokSdk = {
     listener: (value: PotokValue<T>) => void,
     options?: { scope?: "group" },
   ): () => void;
+  /** How a map is drawn: tiles, where it opens, every pin, and what the viewer may do on it. */
+  getMapConfig(): Promise<({ ok: true } & PotokMapConfig) | PotokError>;
+  /** The sub-groups right under this group that the viewer sees and that have a place, up to 2000. */
+  listPlaces(): Promise<{ ok: true; places: PotokPlace[]; truncated: boolean } | PotokError>;
+  /** Makes a sub-group where the viewer tapped; needs `can_create_places`. */
+  createPlace(attrs: PotokPlaceAttrs): Promise<{ ok: true; place: PotokPlace } | PotokError>;
+  /**
+   * Opens a sub-group's description on Potok's page, over the app, with a link
+   * to the group. Its own app, a form or a poll, runs there with that group's
+   * rights. Only for a sub-group right under this group.
+   */
+  showGroup(id: number): Promise<{ ok: true } | PotokError>;
+  /** Gets the id of the group whose description the viewer closed. Returns a function that removes the listener. */
+  onGroupSheetClose(listener: (id: number) => void): () => void;
+  /**
+   * Called when a sub-group of this group was made, changed or deleted, with
+   * no more said: read again what the app shows. Returns a function that
+   * removes the listener.
+   */
+  onSubgroupsChange(listener: () => void): () => void;
 };
 
 /** Legacy API (`#group-panel-description`.potok). */

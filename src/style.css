@@ -1,5 +1,10 @@
 @import "tailwindcss";
 
+/* The dev mock is not in the build, but Tailwind would take its words for
+   classes and add them to the build's CSS. */
+@source not "./potok-dev.ts";
+
+/*! daisyUI | MIT License | https://daisyui.com */
 /* daisyUI components with the `d-` prefix, without themes: the colors come
    from the potok page's theme (the frame follows its data-theme), and
    src/dev-theme.css stands in for it in dev. Without the prefix the page's

@@ -2,6 +2,10 @@ import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { defineConfig, type Plugin, type ResolvedConfig } from 'vite';
 
+// Vite writes here the packages bundled into the app, with their license texts
+// (`build.license`), and potokBuildPlugin puts them at the top of the script.
+const LICENSE_FILE = '.vite/license.json';
+
 function potokBuildPlugin(): Plugin {
   let resolvedConfig: ResolvedConfig;
 
@@ -11,16 +15,36 @@ function potokBuildPlugin(): Plugin {
     configResolved(config) {
       resolvedConfig = config;
     },
-    async writeBundle() {
+    async writeBundle(_options, bundle) {
       const distDir = path.resolve(resolvedConfig.root, resolvedConfig.build.outDir);
       const html = await readFile(path.join(distDir, 'index.html'), 'utf8');
       const bodyHtml = extractBodyHtml(html);
       const css = await collectReferencedContent(html, distDir, /<link\b[^>]*rel=["']stylesheet["'][^>]*href=["']([^"']+)["'][^>]*>/gi);
       const js = await collectReferencedContent(html, distDir, /<script\b[^>]*src=["']([^"']+)["'][^>]*><\/script>/gi);
+      const licenseAsset = bundle[LICENSE_FILE];
+      const licenses = licenseAsset?.type === 'asset' ? licenseComment(licenseAsset.source) : '';
 
-      await writeFile(path.join(distDir, 'potok-build.html'), createPotokHtml({ bodyHtml, css, js }), 'utf8');
+      await writeFile(path.join(distDir, 'potok-build.html'), createPotokHtml({ bodyHtml, css, js, licenses }), 'utf8');
     },
   };
+}
+
+type BundledPackage = { name: string; version: string; identifier?: string; text?: string };
+
+// One legal comment with the name, version and license text of each bundled
+// package, or nothing when the app bundles none.
+function licenseComment(source: string | Uint8Array): string {
+  const packages = JSON.parse(typeof source === 'string' ? source : new TextDecoder().decode(source)) as BundledPackage[];
+  if (packages.length === 0) {
+    return '';
+  }
+
+  const entries = packages.map(({ name, version, identifier, text }) =>
+    [`${name} ${version}${identifier ? ` (${identifier})` : ''}`, text].filter(Boolean).join('\n\n'),
+  );
+  // A `*/` inside a license text would close the comment early.
+  const body = entries.join('\n\n\n').replace(/\*\//g, '* /');
+  return `/*! The packages bundled into this app and their licenses:\n\n${body}\n*/`;
 }
 
 async function collectReferencedContent(html: string, distDir: string, pattern: RegExp): Promise<string> {
@@ -58,7 +82,7 @@ function escapeInlineContent(value: string, tagName: 'script' | 'style'): string
   return value.replace(closingTag, `<\\/${tagName}`);
 }
 
-function createPotokHtml({ bodyHtml, css, js }: { bodyHtml: string; css: string; js: string }): string {
+function createPotokHtml({ bodyHtml, css, js, licenses }: { bodyHtml: string; css: string; js: string; licenses: string }): string {
   return [
     '<!-- style goes here -->',
     '<style>',
@@ -72,6 +96,7 @@ function createPotokHtml({ bodyHtml, css, js }: { bodyHtml: string; css: string;
     '',
     '<!-- script wrapper -->',
     '<script type="module">',
+    ...(licenses ? [escapeInlineContent(licenses, 'script')] : []),
     '(()=>{',
     '  console.debug("<#HOOK#> loading script -> wait for potok");',
     '  const interval = setInterval(() => {',
@@ -107,5 +132,13 @@ export default defineConfig(async ({ command }) => {
 
   return {
     plugins,
+    build: {
+      license: { fileName: LICENSE_FILE },
+      rolldownOptions: {
+        // Vite drops legal comments when it minifies. Keep them (`@license`,
+        // `/*!`), so notices written in the code itself reach the build too.
+        output: { comments: { legal: true } },
+      },
+    },
   };
 });

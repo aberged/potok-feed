@@ -1,4 +1,6 @@
 import type {
+  PotokAggregate,
+  PotokAggregateOptions,
   PotokApi,
   PotokCaps,
   PotokChild,
@@ -337,6 +339,118 @@ function compareRows(orderBy: string | undefined, orderDir: string | undefined) 
     }
 
     return (a.id - b.id) * dir;
+  };
+}
+
+type CursorOptions = { orderBy?: string; orderDir?: string; afterId?: number; beforeId?: number; offset?: number };
+
+// Social.data_value_scan/1: a lone cursor is walked away from, so the page
+// lies right next to it in either order; ordered by a data key, the cursors
+// only narrow by id. `has_more` says whether more lie beyond, away from it.
+function pageNextToCursor<T extends { id: number }>(
+  rows: T[],
+  order: (orderDir: 'asc' | 'desc') => (a: T, b: T) => number,
+  options: CursorOptions,
+  limit: number,
+): { page: T[]; more: boolean } {
+  const afterId = nonNegativeInteger(options.afterId);
+  const beforeId = nonNegativeInteger(options.beforeId);
+  const desc = options.orderDir === 'desc';
+  const keyed = !!options.orderBy?.trim();
+  const flip =
+    !keyed && ((!desc && beforeId !== undefined && afterId === undefined) || (desc && afterId !== undefined && beforeId === undefined));
+  const offset = nonNegativeInteger(options.offset) ?? 0;
+
+  const walked = rows
+    .filter((row) => afterId === undefined || row.id > afterId)
+    .filter((row) => beforeId === undefined || row.id < beforeId)
+    .sort(order(desc !== flip ? 'desc' : 'asc'))
+    .slice(offset, offset + limit + 1);
+
+  const page = walked.slice(0, limit);
+  return { page: flip ? page.reverse() : page, more: walked.length > limit };
+}
+
+// AppApi.match_option/1: none when absent or empty; anything but an object of
+// at most 4 KB as JSON is refused, so a broken filter never reads as everything.
+function matchOption(match: unknown): { ok: true; match: PotokData | null } | PotokError {
+  if (match === undefined || match === null) return { ok: true, match: null };
+  if (typeof match !== 'object' || Array.isArray(match) || new TextEncoder().encode(JSON.stringify(match)).length > 4096) {
+    return { ok: false, error: 'invalid_match' };
+  }
+  return { ok: true, match: Object.keys(match).length ? (match as PotokData) : null };
+}
+
+// ValueAggregate: sums over the numbers at `under` in each value's data.
+const MAX_AGGREGATE_FIELDS = 5;
+const MAX_AGGREGATE_BUCKETS = 50;
+
+function aggregateKey(key: unknown): key is string {
+  return typeof key === 'string' && new TextEncoder().encode(key).length >= 1 && new TextEncoder().encode(key).length <= 64;
+}
+
+// A JSON number, or a string that is a plain decimal, of at most 61 characters.
+function aggregateNumber(item: unknown): number | null {
+  if (typeof item === 'number' && Number.isFinite(item) && String(item).length <= 61) return item;
+  if (typeof item === 'string' && item.length <= 61 && /^-?[0-9]+(\.[0-9]+)?$/.test(item)) return Number(item);
+  return null;
+}
+
+function fieldStats(nodes: unknown[], field: string) {
+  const numbers = nodes
+    .map((node) => aggregateNumber(node && typeof node === 'object' ? (node as PotokData)[field] : undefined))
+    .filter((n): n is number => n !== null);
+  const sum = numbers.reduce((total, n) => total + n, 0);
+
+  return {
+    count: numbers.length,
+    sum,
+    avg: numbers.length ? sum / numbers.length : null,
+    min: numbers.length ? Math.min(...numbers) : null,
+    max: numbers.length ? Math.max(...numbers) : null,
+  };
+}
+
+function aggregate(
+  datas: unknown[],
+  options: PotokAggregateOptions,
+  defaultUnder: string[],
+): ({ ok: true } & PotokAggregate) | PotokError {
+  const invalid: PotokError = { ok: false, error: 'invalid_aggregate' };
+  const fields = [...new Set(options.fields ?? [])];
+  const under = options.under ?? defaultUnder;
+  const groupBy = options.groupBy ?? null;
+
+  if (fields.length > MAX_AGGREGATE_FIELDS || !fields.every(aggregateKey)) return invalid;
+  if (!Array.isArray(under) || under.length > 3 || !under.every(aggregateKey)) return invalid;
+  if (groupBy !== null && !aggregateKey(groupBy)) return invalid;
+
+  const nodes = datas.map((data) => (under.length ? at(data, under) : data));
+  const statsOf = (group: unknown[]) => Object.fromEntries(fields.map((field) => [field, fieldStats(group, field)]));
+
+  if (groupBy === null) {
+    return { ok: true, total: nodes.length, fields: statsOf(nodes), buckets: null, other: null };
+  }
+
+  const groups = new Map<string | null, unknown[]>();
+  for (const node of nodes) {
+    const item = node && typeof node === 'object' ? (node as PotokData)[groupBy] : undefined;
+    const value = ['string', 'number', 'boolean'].includes(typeof item) ? String(item).slice(0, 200) : null;
+    groups.set(value, [...(groups.get(value) ?? []), node]);
+  }
+
+  const sorted = [...groups.entries()].sort(([a, aNodes], [b, bNodes]) =>
+    bNodes.length !== aNodes.length ? bNodes.length - aNodes.length : a === null ? 1 : b === null ? -1 : a < b ? -1 : a > b ? 1 : 0,
+  );
+  const top = sorted.slice(0, MAX_AGGREGATE_BUCKETS);
+  const rest = sorted.slice(MAX_AGGREGATE_BUCKETS);
+
+  return {
+    ok: true,
+    total: nodes.length,
+    fields: statsOf(nodes),
+    buckets: top.map(([value, group]) => ({ value, count: group.length, fields: statsOf(group) })),
+    other: rest.length ? { buckets: rest.length, count: rest.reduce((n, [, group]) => n + group.length, 0) } : null,
   };
 }
 
@@ -755,11 +869,15 @@ function createServer(el: HTMLElement) {
       return { ok: true, value };
     },
 
-    listValues(options: PotokListOptions): { ok: true; values: PotokListedValue[]; has_more: boolean } {
-      const limit = Math.max(1, Math.min(nonNegativeInteger(options.limit) ?? DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT));
-      const offset = nonNegativeInteger(options.offset) ?? 0;
-      const afterId = nonNegativeInteger(options.afterId);
-      const beforeId = nonNegativeInteger(options.beforeId);
+    // What a list or a sum of values outside collections reads: `scope`,
+    // `match` and `searchField` / `searchValue`.
+    plainRows(options: PotokListOptions | PotokAggregateOptions): { ok: true; rows: PotokListedValue[] } | PotokError {
+      if (!viewerMember) {
+        return { ok: false, error: 'not_a_member', message: 'You must be a group member to access group data values.' };
+      }
+
+      const matched = matchOption(options.match);
+      if (!matched.ok) return matched;
       const searchField = options.searchField?.trim();
       const searchValue = options.searchValue?.trim().toLowerCase();
 
@@ -769,13 +887,49 @@ function createServer(el: HTMLElement) {
         // Values in collections never reach the calls that name none.
         .filter((row) => !(row as unknown as { collection?: string }).collection)
         .filter((row) => options.scope === 'group' || ownValue(row))
-        .filter((row) => afterId === undefined || row.id > afterId)
-        .filter((row) => beforeId === undefined || row.id < beforeId)
-        .filter((row) => !searchField || !searchValue || dataText(row, searchField).toLowerCase().includes(searchValue))
-        .sort(compareRows(options.orderBy?.trim(), options.orderDir))
-        .slice(offset, offset + limit + 1);
+        .filter((row) => !matched.match || contains(row.data, matched.match))
+        .filter((row) => !searchField || !searchValue || dataText(row, searchField).toLowerCase().includes(searchValue));
 
-      return { ok: true, values: rows.slice(0, limit), has_more: rows.length > limit };
+      return { ok: true, rows };
+    },
+
+    listValues(
+      options: PotokListOptions,
+    ): { ok: true; values: PotokListedValue[]; has_more: boolean; total: number | null } | PotokError {
+      const limit = Math.max(1, Math.min(nonNegativeInteger(options.limit) ?? DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT));
+      const kept = this.plainRows(options);
+      if (!kept.ok) return kept;
+
+      const orderBy = options.orderBy?.trim();
+      const { page, more } = pageNextToCursor(kept.rows, (dir) => compareRows(orderBy, dir), options, limit);
+
+      return { ok: true, values: page, has_more: more, total: options.total ? kept.rows.length : null };
+    },
+
+    aggregateValues(options: PotokAggregateOptions): ({ ok: true } & PotokAggregate) | PotokError {
+      if (options.collection) {
+        const config = loadConfig();
+        const rule = devRule(config, options.collection);
+        if (!fullReader(rule)) {
+          return viewerMember
+            ? forbidden
+            : { ok: false, error: 'not_a_member', message: 'You must be a group member to access group data values.' };
+        }
+
+        const matched = matchOption(options.match);
+        if (!matched.ok) return matched;
+
+        syncValues();
+        const rows = (values as unknown as PotokCollectionValue[])
+          .filter((row) => row.collection === options.collection && ownValue(row))
+          .filter((row) => !matched.match || contains(row.data, matched.match));
+
+        return aggregate(rows.map((row) => row.data), options, rule.under ?? []);
+      }
+
+      const kept = this.plainRows(options);
+      if (!kept.ok) return kept;
+      return aggregate(kept.rows.map((row) => row.data), options, []);
     },
 
     updateDescription(params: {
@@ -1224,26 +1378,26 @@ function createServer(el: HTMLElement) {
         return { ok: false, error: 'not_a_member', message: 'You must be a group member to access group data values.' };
       }
 
+      const matched = matchOption(options.match);
+      if (!matched.ok) return matched;
+
       syncValues();
       const limit = Math.max(1, Math.min(nonNegativeInteger(options.limit) ?? DEFAULT_LIST_LIMIT, MAX_COLLECTION_LIMIT));
-      const offset = nonNegativeInteger(options.offset) ?? 0;
       const key = config?.data.secret?.score?.[options.collection] ?? {};
 
       const kept = (values as unknown as PotokCollectionValue[])
         .filter((row) => row.collection === options.collection && ownValue(row))
         .filter((row) => !(options.mine || !full) || row.creator_id === viewerId)
-        .filter((row) => !full || !options.match || contains(row.data, options.match));
+        .filter((row) => !full || !matched.match || contains(row.data, matched.match));
 
-      const rows = kept
-        .filter((row) => options.afterId === undefined || row.id > options.afterId)
-        .filter((row) => options.beforeId === undefined || row.id < options.beforeId)
-        .sort((a, b) => (options.orderDir === 'desc' ? b.id - a.id : a.id - b.id))
-        .slice(offset, offset + limit + 1);
+      const byId = (dir: 'asc' | 'desc') => (a: PotokCollectionValue, b: PotokCollectionValue) =>
+        dir === 'desc' ? b.id - a.id : a.id - b.id;
+      const { page, more } = pageNextToCursor(kept, byId, options, limit);
 
       return {
         ok: true,
-        values: rows.slice(0, limit).map((row) => this.present(row, rule, key)),
-        has_more: rows.length > limit,
+        values: page.map((row) => this.present(row, rule, key)),
+        has_more: more,
         total: options.total ? kept.length : null,
       };
     },
@@ -1508,6 +1662,10 @@ function createSdk(server: DevServer): PotokSdk {
 
     async summarizeValues(collection, options = {}) {
       return server.summarizeCollection(collection, options);
+    },
+
+    async aggregateValues(options = {}) {
+      return server.aggregateValues(options);
     },
 
     async gradeValue(id, items) {

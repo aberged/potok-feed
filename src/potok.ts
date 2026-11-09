@@ -57,7 +57,13 @@ export type PotokError = {
     | "conflict"
     | "no_config"
     | "not_scored"
-    | "invalid_summary";
+    | "invalid_summary"
+    /** `match` was not an object of at most 4 KB as JSON. */
+    | "invalid_match"
+    /** `aggregateValues`: a bad key, path or too many fields. */
+    | "invalid_aggregate"
+    /** A count or sum took over 5 seconds. */
+    | "timeout";
   message?: string;
   reason?: string;
   current?: unknown;
@@ -126,22 +132,28 @@ export type PotokCollectionValue<T extends object = PotokData> = Omit<
 export type PotokListOptions = {
   /** Page size, at most 200 (the server's default is 50). */
   limit?: number;
+  /** Counts on from the cursor, if there is one. */
   offset?: number;
-  /** Only values with a greater id. */
+  /** The values right after this id; `has_more` then means newer ones beyond. */
   afterId?: number;
-  /** Only values with a smaller id. */
+  /** The values right before this id; `has_more` then means older ones beyond. */
   beforeId?: number;
   /** Key in `data` that must contain `searchValue` (case-insensitive). */
   searchField?: string;
   searchValue?: string;
-  /** Key in `data` to order by; without it values come in insertion order. */
+  /** Only values whose data contains this: `{status: "open"}`. JSON types count: `{n: 5}` does not find `"5"`. */
+  match?: PotokData;
+  /** Adds `total`, the count of what the filters keep. */
+  total?: boolean;
+  /** Key in `data` to order by; then the cursors only narrow by id. Without it, the order they were written in. */
   orderBy?: string;
+  /** "desc" for the newest first. */
   orderDir?: "asc" | "desc";
   /** "group" adds the values of the group's other apps that the viewer can open. */
   scope?: "group";
 };
 
-/** A page of a collection: by id, at most 100 values. */
+/** A page of a collection: by id, at most 100 values, right next to a cursor. */
 export type PotokCollectionListOptions = {
   collection: string;
   limit?: number;
@@ -273,6 +285,40 @@ export type PotokSummary = {
     distribution: { score: number; count: number }[];
     items: Record<string, { ok?: number; bad?: number; pending?: number }>;
   } | null;
+};
+
+/** What `aggregateValues` adds up. Keys are 1 to 64 bytes. */
+export type PotokAggregateOptions = {
+  /** Up to 5 keys holding numbers: JSON numbers or plain decimal strings ("12", "-3.5"). */
+  fields?: string[];
+  /** A key to group by; its value as text, cut to 200 characters. */
+  groupBy?: string;
+  /** Path of up to 3 keys to the object the keys are read in; the top of `data` by default. */
+  under?: string[];
+  match?: PotokData;
+  searchField?: string;
+  searchValue?: string;
+  scope?: "group";
+  /** A collection, for those who read all of it; read at its rule's `under` by default. */
+  collection?: string;
+};
+
+/** `count` values held a number; `sum` is 0 and the rest null when none did. */
+export type PotokFieldStats = {
+  count: number;
+  sum: number;
+  avg: number | null;
+  min: number | null;
+  max: number | null;
+};
+
+export type PotokAggregate = {
+  total: number;
+  fields: Record<string, PotokFieldStats>;
+  /** With `groupBy`: the 50 biggest groups first; `value` is null for values without one. */
+  buckets: { value: string | null; count: number; fields: Record<string, PotokFieldStats> }[] | null;
+  /** The groups past the 50 biggest, or null. */
+  other: { buckets: number; count: number } | null;
 };
 
 /** A file sent from the frame; put `{file}` into the value. */
@@ -492,7 +538,11 @@ export type PotokSdk = {
   >;
   listValues<T extends object = PotokData>(
     options?: PotokListOptions,
-  ): Promise<{ ok: true; values: PotokListedValue<T>[]; has_more: boolean } | PotokError>;
+  ): Promise<
+    { ok: true; values: PotokListedValue<T>[]; has_more: boolean; total: number | null } | PotokError
+  >;
+  /** Sums in the database over what `listValues` would page through; 120 a minute with `summarizeValues`. */
+  aggregateValues(options?: PotokAggregateOptions): Promise<({ ok: true } & PotokAggregate) | PotokError>;
   /** The config and, per ruled collection, what the viewer may do there. */
   getConfig(): Promise<PotokConfigReply | PotokError>;
   /** For editors. Pass the revision you started from (0 for the first save). */

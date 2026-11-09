@@ -2,11 +2,11 @@
 
 Potok aplikacija koja simulira news-feed. Jedna grupa je jedna vest, a njen opis je tekst vesti. Svajpom se ide redom kroz vesti. Dole su datum objave, reakcije, deljenje i dugme **Komentari**, koje vodi u razgovor o vesti. Dugme sa datumom otvara filter po datumu. Vest može da bude i aplikacija, koju pokreće dugme **Otvori**.
 
-Napravljena je po šablonu [potok-vite](../potok-vite/README.md). Aplikacija je jedan fajl, `dist/potok-build.html`, koji se nalepi kao opis grupe sa uključenim „Koristi API“.
+Napravljena je po šablonu [potok-vite](https://github.com/aberged/potok-vite/tree/align-alt-descriptions). Aplikacija je jedan fajl, `dist/potok-build.html`, koji se nalepi kao opis grupe sa uključenim „Koristi API“.
 
 Traži `listSubgroups`, `openGroup`, `toggleGroupReaction`, `pickEmoji`, `shareGroup`, `linkGroup` i `getLinkedGroup` iz App API-ja, pa radi tek uz verziju potok-a koja ih ima.
 
-Radi u paru sa aplikacijom [FeedCreator](../potok-feed-creator/README.md), koja stoji u `.feed` i pravi vesti. Taj par je opisan u `docs/feed-i-feedcreator.md` u projektu potok-ide.
+Radi u paru sa aplikacijom [FeedCreator](https://github.com/aberged/potok-feed-creator), koja stoji u `.feed` i pravi vesti. Taj par je opisan u `docs/feed-i-feedcreator.md` u projektu potok-ide.
 
 ## Postavljanje u potok-u
 
@@ -68,3 +68,7 @@ U dev-u primer podataka zadaje `?seed` u URL-u:
 | [src/dev-tools.ts](src/dev-tools.ts), [src/dev-theme.css](src/dev-theme.css) | samo za dev: primer vesti i zamena za temu stranice |
 
 `src/potok.ts`, `src/potok-dev.ts`, `vite.config.ts` i `tsconfig.json` su iz šablona, bez izmena.
+
+## Licenca
+
+MIT, vidi [LICENSE](LICENSE).

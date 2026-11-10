@@ -493,6 +493,7 @@ export type PotokMapConfig = {
 export type PotokPlace = {
   id: number;
   name: string;
+  /** Where its pin stands; for an area, a point inside it. */
   lat: number;
   lng: number;
   /** A key of `pins.kinds`. */
@@ -501,6 +502,25 @@ export type PotokPlace = {
   pin: string | null;
   picture_url: string | null;
   is_public: boolean;
+  /** "area" for a group that covers an area (its border comes from `placeShapes`). */
+  shape: 'point' | 'area';
+  /**
+   * The areas among the map's places that hold this one, smallest first: its
+   * pin lies inside them, and for an area they are the bigger ones.
+   */
+  areas: number[];
+  /** An area's box: [west, south, east, north]. */
+  bbox?: [number, number, number, number];
+  /** Changes with an area's border: what to keep its borders by. */
+  v?: number;
+};
+
+/** The border of an area, simplified for one level of detail (`placeShapes`). */
+export type PotokPlaceShape = {
+  id: number;
+  /** The `v` of its place. */
+  v: number;
+  geojson: { type: 'MultiPolygon'; coordinates: [number, number][][][] };
 };
 
 /** A new place: a sub-group from a preset, as Potok's menu makes it, standing at `lat`, `lng`. */
@@ -758,6 +778,15 @@ export type PotokSdk = {
   getMapConfig(): Promise<({ ok: true } & PotokMapConfig) | PotokError>;
   /** The sub-groups right under this group that the viewer sees and that have a place, up to 2000. */
   listPlaces(): Promise<{ ok: true; places: PotokPlace[]; truncated: boolean } | PotokError>;
+  /**
+   * The borders of areas among `listPlaces` (at most 100 ids), simplified for
+   * `zoom`; `level` is the zoom they were simplified for (6, 8, 10, 12, 14 or
+   * 16). Keep them by `id`, `v` and `level`.
+   */
+  placeShapes(
+    ids: number[],
+    zoom: number,
+  ): Promise<{ ok: true; level: number; shapes: PotokPlaceShape[] } | PotokError>;
   /** Makes a sub-group where the viewer tapped; needs `can_create_places`. */
   createPlace(attrs: PotokPlaceAttrs): Promise<{ ok: true; place: PotokPlace } | PotokError>;
   /**

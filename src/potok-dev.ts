@@ -22,6 +22,7 @@ import type {
   PotokOwnGroup,
   PotokPlace,
   PotokPlaceAttrs,
+  PotokPlaceShape,
   PotokPoll,
   PotokPollListOptions,
   PotokProfile,
@@ -62,9 +63,11 @@ import type {
 // both say the poll changed.
 //
 // A map's places (`listPlaces`, `createPlace`) are in `potok-dev:places`, as
-// `PotokPlace[]`, and what `getMapConfig` answers in `potok-dev:map-config`:
-// a map app seeds both in dev. `showGroup` only says what Potok would open,
-// then says it closed.
+// `PotokPlace[]`, the borders of its areas (`placeShapes`) in
+// `potok-dev:place-shapes` by id, and what `getMapConfig` answers in
+// `potok-dev:map-config`: a map app seeds them in dev, `shape`, `areas` and
+// `bbox` included, as the mock works out no geometry. `showGroup` only says
+// what Potok would open, then says it closed.
 //
 // Collections (`getConfig`, `insertValue` with a collection, ...) follow the
 // rules of the app's config like the server does, for the viewer `?viewer=`
@@ -76,6 +79,8 @@ const CHILDREN_STORAGE_KEY = 'potok-dev:children';
 const GROUP_STORAGE_KEY = 'potok-dev:group';
 const POLLS_STORAGE_KEY = 'potok-dev:polls';
 const PLACES_STORAGE_KEY = 'potok-dev:places';
+const PLACE_SHAPES_STORAGE_KEY = 'potok-dev:place-shapes';
+const SHAPE_LEVELS = [6, 8, 10, 12, 14, 16];
 const MAP_CONFIG_STORAGE_KEY = 'potok-dev:map-config';
 const POLL_PAGE_SIZE = 30;
 const LINK_PARAM = 'at';
@@ -131,12 +136,24 @@ const pollListeners = new Set<(id: number) => void>();
 const subgroupListeners = new Set<() => void>();
 const sheetListeners = new Set<(id: number) => void>();
 
+// Places seeded before areas were points.
 function loadPlaces(): PotokPlace[] {
   try {
     const stored: unknown = JSON.parse(localStorage.getItem(PLACES_STORAGE_KEY) || '[]');
-    return Array.isArray(stored) ? stored : [];
+    return Array.isArray(stored)
+      ? stored.map((place: PotokPlace) => ({ ...place, shape: place.shape ?? 'point', areas: place.areas ?? [] }))
+      : [];
   } catch {
     return [];
+  }
+}
+
+function loadPlaceShapes(): Record<string, PotokPlaceShape['geojson']> {
+  try {
+    const stored: unknown = JSON.parse(localStorage.getItem(PLACE_SHAPES_STORAGE_KEY) || '{}');
+    return stored && typeof stored === 'object' ? (stored as Record<string, PotokPlaceShape['geojson']>) : {};
+  } catch {
+    return {};
   }
 }
 
@@ -1272,6 +1289,22 @@ function createServer(el: HTMLElement) {
       return { ok: true, places: loadPlaces(), truncated: false };
     },
 
+    // The borders as seeded, whatever the zoom.
+    placeShapes(ids: number[], zoom: number): { ok: true; level: number; shapes: PotokPlaceShape[] } | PotokError {
+      if (!Array.isArray(ids) || typeof zoom !== 'number') return { ok: false, error: 'invalid_place' };
+
+      const level = SHAPE_LEVELS.find((candidate) => candidate >= zoom) ?? 16;
+      const stored = loadPlaceShapes();
+      const places = new Map(loadPlaces().map((place) => [place.id, place]));
+      const shapes = ids.slice(0, 100).flatMap((id) => {
+        const place = places.get(id);
+        const geojson = stored[String(id)];
+        return place?.shape === 'area' && geojson ? [{ id, v: place.v ?? 0, geojson }] : [];
+      });
+
+      return { ok: true, level, shapes };
+    },
+
     createPlace(attrs: PotokPlaceAttrs): { ok: true; place: PotokPlace } | PotokError {
       const config = loadMapConfig();
       if (!config.can_create_places) return forbidden;
@@ -1298,6 +1331,8 @@ function createServer(el: HTMLElement) {
         pin: attrs.pin ?? null,
         picture_url: null,
         is_public: attrs.isPublic ?? false,
+        shape: 'point',
+        areas: [],
       };
 
       localStorage.setItem(PLACES_STORAGE_KEY, JSON.stringify([...places, place]));
@@ -1915,6 +1950,10 @@ function createSdk(server: DevServer): PotokSdk {
 
     async listPlaces() {
       return server.listPlaces();
+    },
+
+    async placeShapes(ids, zoom) {
+      return server.placeShapes(ids, zoom);
     },
 
     async createPlace(attrs) {

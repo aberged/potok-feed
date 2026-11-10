@@ -461,6 +461,12 @@ export type PotokPinLook = {
   /** A key of `tones`. */
   tone: string;
   paths: PotokPinPath[];
+  /**
+   * A kind's small glyph (Heroicons 16 solid), which a pin the group picked
+   * keeps in its top right corner, as on the group's avatar; null for "none".
+   * Icons have none.
+   */
+  mark?: PotokPinPath[] | null;
 };
 
 /** What a map needs before its first pin (`getMapConfig`). */
@@ -474,6 +480,8 @@ export type PotokMapConfig = {
     drop: string;
     /** Where the glyph goes in the drop, as an SVG transform. */
     glyph_transform: string;
+    /** Where a kind's `mark` goes, in a white disc of radius 5.5 around (26.5, 6.5), as an SVG transform. Potok always sends it. */
+    mark_transform?: string;
     /** The colour of each tone, as `#rrggbb`; a white glyph reads on every one. */
     tones: Record<string, string>;
     /** What a group shows by its kind: its preset, "app" or "none". */

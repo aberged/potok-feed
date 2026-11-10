@@ -501,7 +501,7 @@ export type PotokMapConfig = {
 export type PotokPlace = {
   id: number;
   name: string;
-  /** Where its pin stands; for an area, a point inside it. */
+  /** Where its pin stands; for an area, a point inside it; for a route, its start. */
   lat: number;
   lng: number;
   /** A key of `pins.kinds`. */
@@ -510,25 +510,36 @@ export type PotokPlace = {
   pin: string | null;
   picture_url: string | null;
   is_public: boolean;
-  /** "area" for a group that covers an area (its border comes from `placeShapes`). */
-  shape: 'point' | 'area';
+  /**
+   * "area" for a group that covers an area, "route" for one that runs along a
+   * line, such as a walk or a bike path (their shapes come from `placeShapes`).
+   */
+  shape: 'point' | 'area' | 'route';
   /**
    * The areas among the map's places that hold this one, smallest first: its
-   * pin lies inside them, and for an area they are the bigger ones.
+   * pin lies inside them, and for an area they are the bigger ones; a route
+   * lies in every area it passes through.
    */
   areas: number[];
-  /** An area's box: [west, south, east, north]. */
+  /** An area's or a route's box: [west, south, east, north]. */
   bbox?: [number, number, number, number];
-  /** Changes with an area's border: what to keep its borders by. */
+  /** Changes with an area's border or a route's line: what to keep its shapes by. */
   v?: number;
+  /** A route's length, in metres along the Earth's surface. */
+  length?: number;
 };
 
-/** The border of an area, simplified for one level of detail (`placeShapes`). */
+/**
+ * The shape of an area or a route, simplified for one level of detail
+ * (`placeShapes`): a border for an area, a line for a route.
+ */
 export type PotokPlaceShape = {
   id: number;
   /** The `v` of its place. */
   v: number;
-  geojson: { type: 'MultiPolygon'; coordinates: [number, number][][][] };
+  geojson:
+    | { type: 'MultiPolygon'; coordinates: [number, number][][][] }
+    | { type: 'MultiLineString'; coordinates: [number, number][][] };
 };
 
 /** A new place: a sub-group from a preset, as Potok's menu makes it, standing at `lat`, `lng`. */
@@ -787,9 +798,9 @@ export type PotokSdk = {
   /** The sub-groups right under this group that the viewer sees and that have a place, up to 2000. */
   listPlaces(): Promise<{ ok: true; places: PotokPlace[]; truncated: boolean } | PotokError>;
   /**
-   * The borders of areas among `listPlaces` (at most 100 ids), simplified for
-   * `zoom`; `level` is the zoom they were simplified for (6, 8, 10, 12, 14 or
-   * 16). Keep them by `id`, `v` and `level`.
+   * The borders of areas and the lines of routes among `listPlaces` (at most
+   * 100 ids), simplified for `zoom`; `level` is the zoom they were simplified
+   * for (6, 8, 10, 12, 14 or 16). Keep them by `id`, `v` and `level`.
    */
   placeShapes(
     ids: number[],

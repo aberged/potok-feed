@@ -63,10 +63,10 @@ import type {
 // both say the poll changed.
 //
 // A map's places (`listPlaces`, `createPlace`) are in `potok-dev:places`, as
-// `PotokPlace[]`, the borders of its areas (`placeShapes`) in
-// `potok-dev:place-shapes` by id, and what `getMapConfig` answers in
-// `potok-dev:map-config`: a map app seeds them in dev, `shape`, `areas` and
-// `bbox` included, as the mock works out no geometry. `showGroup` only says
+// `PotokPlace[]`, the borders of its areas and the lines of its routes
+// (`placeShapes`) in `potok-dev:place-shapes` by id, and what `getMapConfig`
+// answers in `potok-dev:map-config`: a map app seeds them in dev, `shape`,
+// `areas`, `bbox` and `length` included, as the mock works out no geometry. `showGroup` only says
 // what Potok would open, then says it closed.
 //
 // Collections (`getConfig`, `insertValue` with a collection, ...) follow the
@@ -1289,7 +1289,7 @@ function createServer(el: HTMLElement) {
       return { ok: true, places: loadPlaces(), truncated: false };
     },
 
-    // The borders as seeded, whatever the zoom.
+    // The borders and lines as seeded, whatever the zoom.
     placeShapes(ids: number[], zoom: number): { ok: true; level: number; shapes: PotokPlaceShape[] } | PotokError {
       if (!Array.isArray(ids) || typeof zoom !== 'number') return { ok: false, error: 'invalid_place' };
 
@@ -1299,7 +1299,9 @@ function createServer(el: HTMLElement) {
       const shapes = ids.slice(0, 100).flatMap((id) => {
         const place = places.get(id);
         const geojson = stored[String(id)];
-        return place?.shape === 'area' && geojson ? [{ id, v: place.v ?? 0, geojson }] : [];
+        return (place?.shape === 'area' || place?.shape === 'route') && geojson
+          ? [{ id, v: place.v ?? 0, geojson }]
+          : [];
       });
 
       return { ok: true, level, shapes };

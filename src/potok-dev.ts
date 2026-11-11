@@ -3,8 +3,10 @@ import type {
   PotokAggregateOptions,
   PotokApi,
   PotokCaps,
+  PotokBounds,
   PotokChild,
   PotokChildAttrs,
+  PotokCreatedChild,
   PotokCollectionListOptions,
   PotokCollectionValue,
   PotokConfig,
@@ -19,9 +21,15 @@ import type {
   PotokListOptions,
   PotokManaged,
   PotokMapConfig,
+  PotokNewChild,
   PotokOwnGroup,
+  PotokPinCount,
   PotokPlace,
   PotokPlaceAttrs,
+  PotokPlaceCluster,
+  PotokPlacesAll,
+  PotokPlacesQuery,
+  PotokPlacesView,
   PotokPlaceShape,
   PotokPoll,
   PotokPollListOptions,
@@ -67,7 +75,11 @@ import type {
 // (`placeShapes`) in `potok-dev:place-shapes` by id, and what `getMapConfig`
 // answers in `potok-dev:map-config`: a map app seeds them in dev, `shape`,
 // `areas`, `bbox` and `length` included, as the mock works out no geometry. `showGroup` only says
-// what Potok would open, then says it closed.
+// what Potok would open, then says it closed. A sub-group the app gives a
+// place (`createChild`, `createChildren`, `updateChild` with `lat`, `lng`)
+// is a place as well. Past 2000 places, `listPlaces(view)` gathers them into
+// cells as Potok does. What does not fit in localStorage lives until the next
+// reload.
 //
 // Collections (`getConfig`, `insertValue` with a collection, ...) follow the
 // rules of the app's config like the server does, for the viewer `?viewer=`
@@ -91,6 +103,12 @@ const MAX_SUBGROUP_LIMIT = 50;
 const LEGACY_PAGE_SIZE = 200;
 const LEGACY_MAX_ROWS = 5_000;
 const MAX_GROUP_NAME_LENGTH = 120;
+const MAX_CHILDREN_PER_CALL = 100;
+const MAX_KEY_LENGTH = 64;
+const MAX_PLACES = 2_000;
+const MAX_CELLS = 2_000;
+const MAX_SPOT = 50;
+const MERCATOR_MAX_LAT = 85.0511287798;
 const MAX_PICTURE_LENGTH = 1_000_000;
 /** Who an inheriting sub-group holds besides the viewer. */
 const DEV_INHERITED_MEMBERS = 4;
@@ -136,8 +154,13 @@ const pollListeners = new Set<(id: number) => void>();
 const subgroupListeners = new Set<() => void>();
 const sheetListeners = new Set<(id: number) => void>();
 
+// Places that did not fit in localStorage, until the next reload.
+let memoryPlaces: PotokPlace[] | null = null;
+
 // Places seeded before areas were points.
 function loadPlaces(): PotokPlace[] {
+  if (memoryPlaces) return memoryPlaces;
+
   try {
     const stored: unknown = JSON.parse(localStorage.getItem(PLACES_STORAGE_KEY) || '[]');
     return Array.isArray(stored)
@@ -146,6 +169,118 @@ function loadPlaces(): PotokPlace[] {
   } catch {
     return [];
   }
+}
+
+function savePlaces(places: PotokPlace[]) {
+  try {
+    localStorage.setItem(PLACES_STORAGE_KEY, JSON.stringify(places));
+    memoryPlaces = null;
+  } catch {
+    if (!memoryPlaces) console.warn('[potok-dev] The places do not fit in localStorage: they live until the next reload.');
+    memoryPlaces = places;
+  }
+}
+
+// --- A big map's view, gathered as Potok gathers it (Social.list_map_cells) ---
+
+// Lower case, no accents: a rough stand-in for Potok's name search.
+const foldName = (text: string) =>
+  text
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/đ/gi, 'dj')
+    .toLowerCase();
+
+// What the pin filter sees a place as: its icon, "picture", or "kind".
+function pinKeyOf(place: PotokPlace, icons: Set<string>): string {
+  return place.pin === 'picture' || (place.pin !== null && icons.has(place.pin)) ? place.pin : 'kind';
+}
+
+function placesFilter(config: PotokMapConfig, search: string | undefined, pins: string[] | undefined) {
+  const icons = new Set(config.pins.icons.map((icon) => icon.key));
+  const term = search ? foldName(search.trim()) : '';
+  const wanted = Array.isArray(pins) && pins.length > 0 ? new Set(pins) : null;
+
+  return (place: PotokPlace) =>
+    (term === '' || foldName(place.name).includes(term)) && (!wanted || wanted.has(pinKeyOf(place, icons)));
+}
+
+function pinCounts(places: PotokPlace[], config: PotokMapConfig): PotokPinCount[] {
+  const icons = new Set(config.pins.icons.map((icon) => icon.key));
+  const counts = new Map<string, number>();
+  places.forEach((place) => counts.set(pinKeyOf(place, icons), (counts.get(pinKeyOf(place, icons)) ?? 0) + 1));
+
+  return [...counts].map(([pin, count]) => ({ pin, count })).sort((a, b) => b.count - a.count || a.pin.localeCompare(b.pin));
+}
+
+function placesExtent(places: PotokPlace[]): { count: number; bounds: PotokBounds | null } {
+  if (places.length === 0) return { count: 0, bounds: null };
+
+  const lats = places.map((place) => place.lat);
+  const lngs = places.map((place) => place.lng);
+  return {
+    count: places.length,
+    bounds: [
+      [Math.min(...lats), Math.min(...lngs)],
+      [Math.max(...lats), Math.max(...lngs)],
+    ],
+  };
+}
+
+const inBox = (place: PotokPlace, [west, south, east, north]: PotokPlacesQuery['bbox']) =>
+  place.lat >= south &&
+  place.lat <= north &&
+  (west <= east ? place.lng >= west && place.lng <= east : place.lng >= west || place.lng <= east);
+
+// Cells of a Web Mercator grid with 4 * 2^zoom cells a side: about 64 pixels.
+function gatherPlaces(places: PotokPlace[], view: PotokPlacesQuery, config: PotokMapConfig) {
+  const cells = 4 * 2 ** Math.max(0, Math.min(24, Math.trunc(view.zoom)));
+  const tones = new Map(config.pins.icons.map((icon) => [icon.key, icon.tone]));
+  const groups = new Map<string, PotokPlace[]>();
+
+  for (const place of places) {
+    if (!inBox(place, view.bbox)) continue;
+
+    const lat = (Math.min(Math.max(place.lat, -MERCATOR_MAX_LAT), MERCATOR_MAX_LAT) * Math.PI) / 180;
+    const x = Math.floor(((place.lng + 180) / 360) * cells);
+    const y = Math.floor(((1 - Math.log(Math.tan(lat) + 1 / Math.cos(lat)) / Math.PI) / 2) * cells);
+    const key = `${x}:${y}`;
+    groups.set(key, [...(groups.get(key) ?? []), place]);
+  }
+
+  const kept = [...groups.values()].sort((a, b) => b.length - a.length);
+  const truncated = kept.length > MAX_CELLS;
+  const shown = kept.slice(0, MAX_CELLS);
+
+  const clusters: PotokPlaceCluster[] = shown
+    .filter((cell) => cell.length > 1)
+    .map((cell) => {
+      const lats = cell.map((place) => place.lat);
+      const lngs = cell.map((place) => place.lng);
+      const toneCounts: Record<string, number> = {};
+      cell.forEach((place) => {
+        const tone = (place.pin && tones.get(place.pin)) || 'kind';
+        toneCounts[tone] = (toneCounts[tone] ?? 0) + 1;
+      });
+
+      return {
+        count: cell.length,
+        lat: lats.reduce((sum, value) => sum + value, 0) / cell.length,
+        lng: lngs.reduce((sum, value) => sum + value, 0) / cell.length,
+        bounds: [
+          [Math.min(...lats), Math.min(...lngs)],
+          [Math.max(...lats), Math.max(...lngs)],
+        ] as PotokBounds,
+        tones: toneCounts,
+      };
+    });
+
+  return {
+    places: shown.filter((cell) => cell.length === 1).map((cell) => cell[0]),
+    clusters,
+    total: kept.reduce((sum, cell) => sum + cell.length, 0),
+    truncated,
+  };
 }
 
 function loadPlaceShapes(): Record<string, PotokPlaceShape['geojson']> {
@@ -278,7 +413,15 @@ function saveSubgroups(subgroups: Record<string, PotokSubgroup[]>) {
 function loadChildren(): PotokChild[] {
   try {
     const stored: unknown = JSON.parse(localStorage.getItem(CHILDREN_STORAGE_KEY) || '[]');
-    return Array.isArray(stored) ? (stored as PotokChild[]) : [];
+    return Array.isArray(stored)
+      ? stored.map((child: PotokChild) => ({
+          ...child,
+          key: child.key ?? null,
+          lat: child.lat ?? null,
+          lng: child.lng ?? null,
+          pin: child.pin ?? null,
+        }))
+      : [];
   } catch {
     return [];
   }
@@ -863,14 +1006,34 @@ function createServer(el: HTMLElement) {
 
   const invalidGroup: PotokError = { ok: false, error: 'invalid_group', message: 'Could not save the group.' };
 
-  const validAttrs = (attrs: PotokChildAttrs) =>
+  const inRange = (value: unknown, bound: number) => typeof value === 'number' && Math.abs(value) <= bound;
+
+  // Both or neither, numbers in range; both null only where `nulls` (to take a place away).
+  const validPlace = (lat: unknown, lng: unknown, nulls: boolean) =>
+    (lat === undefined && lng === undefined) ||
+    (nulls && lat === null && lng === null) ||
+    (inRange(lat, 90) && inRange(lng, 180));
+
+  // A key of the seeded pins (any, while none are seeded), "picture" or null.
+  const validPin = (pin: unknown) => {
+    if (pin === undefined || pin === null || pin === 'picture') return true;
+    const icons = loadMapConfig().pins.icons.map((icon) => icon.key);
+    return typeof pin === 'string' && (icons.length === 0 || icons.includes(pin));
+  };
+
+  const validAttrs = (attrs: PotokChildAttrs, nulls = true) =>
     (attrs.name === undefined || (attrs.name.trim() !== '' && attrs.name.length <= MAX_GROUP_NAME_LENGTH)) &&
-    (attrs.picture === undefined || attrs.picture.length <= MAX_PICTURE_LENGTH);
+    (attrs.picture === undefined || attrs.picture.length <= MAX_PICTURE_LENGTH) &&
+    validPlace(attrs.lat, attrs.lng, nulls) &&
+    validPin(attrs.pin);
+
+  const round6 = (value: number) => Math.round(value * 1e6) / 1e6;
 
   const applyAttrs = (child: PotokChild, attrs: PotokChildAttrs): PotokChild => {
     const description = attrs.description ?? child.description ?? '';
     const format = attrs.descriptionFormat ?? child.description_format;
     const inherits = attrs.inheritsMembers ?? child.inherits_members;
+    const placed = attrs.lat !== undefined;
 
     return {
       ...child,
@@ -882,8 +1045,76 @@ function createServer(el: HTMLElement) {
       inherits_members: inherits,
       picture_url: attrs.picture === '' ? devPicture(child.id) : (attrs.picture ?? child.picture_url),
       member_count: inherits ? 1 + DEV_INHERITED_MEMBERS : child.member_count,
+      lat: placed ? (attrs.lat === null ? null : round6(attrs.lat as number)) : child.lat,
+      lng: placed ? (attrs.lng === null ? null : round6(attrs.lng as number)) : child.lng,
+      pin: attrs.pin !== undefined ? attrs.pin : child.pin,
       updated_at: timestamp(),
     };
+  };
+
+  // One id space for sub-groups and places, as both are groups in potok.
+  const nextId = () =>
+    Math.max(
+      100,
+      children.reduce((max, row) => Math.max(max, row.id), 0),
+      loadPlaces().reduce((max, row) => Math.max(max, row.id), 0),
+    ) + 1;
+
+  const newChild = (id: number, name: string, key: string | null): PotokChild => {
+    const now = timestamp();
+
+    return {
+      id,
+      name,
+      description_html: null,
+      app_description: null,
+      uses_api: false,
+      picture_url: devPicture(id),
+      is_public: false,
+      inherits_members: false,
+      creator_id: devProfile.id,
+      inserted_at: now,
+      published_at: null,
+      last_value_at: null,
+      comment_count: 0,
+      reactions: [],
+      can_react: true,
+      description: '',
+      description_format: 'markdown',
+      can_edit: true,
+      member_count: 1,
+      updated_at: now,
+      key,
+      lat: null,
+      lng: null,
+      pin: null,
+    };
+  };
+
+  // A sub-group with a place is one of the map's places, a plain group ("none").
+  const placeOfChild = (child: PotokChild): PotokPlace | null =>
+    child.lat === null || child.lng === null
+      ? null
+      : {
+          id: child.id,
+          name: child.name,
+          lat: child.lat,
+          lng: child.lng,
+          kind: 'none',
+          pin: child.pin,
+          picture_url: null,
+          is_public: child.is_public,
+          shape: 'point',
+          areas: [],
+        };
+
+  const syncPlaces = (changed: PotokChild[]) => {
+    const ids = new Set(changed.map((child) => child.id));
+    const added = changed.flatMap((child) => placeOfChild(child) ?? []);
+    const before = loadPlaces();
+    if (added.length === 0 && !before.some((place) => ids.has(place.id))) return;
+
+    savePlaces([...before.filter((place) => !ids.has(place.id)), ...added]);
   };
 
   // The child, or the failure the server answers with.
@@ -899,8 +1130,14 @@ function createServer(el: HTMLElement) {
   const storeChild = (child: PotokChild) => {
     children = [...children.filter((row) => row.id !== child.id), child];
     saveChildren(children);
+    syncPlaces([child]);
     return { ok: true as const, group: child };
   };
+
+  // A key as the server takes it: 1 to 64 characters, no control characters.
+  const validKey = (key: unknown) =>
+    key === undefined ||
+    (typeof key === 'string' && key.length >= 1 && key.length <= MAX_KEY_LENGTH && !/[\u0000-\u001f\u007f]/.test(key));
 
   return {
     insertValue(params: { data: string; content_format: PotokContentFormat }): { ok: true; value: PotokValue } | PotokError {
@@ -1133,38 +1370,55 @@ function createServer(el: HTMLElement) {
 
     createChild(attrs: PotokChildAttrs & { name: string }): { ok: true; group: PotokChild } | PotokError {
       if (!ownGroup.can_create_children) return forbidden;
-      if (!validAttrs(attrs)) return invalidGroup;
+      if (!validAttrs(attrs, false)) return invalidGroup;
 
-      const id = children.reduce((max, row) => Math.max(max, row.id), 100) + 1;
-      const now = timestamp();
+      return storeChild(applyAttrs(newChild(nextId(), attrs.name, null), attrs));
+    },
 
-      return storeChild(
-        applyAttrs(
-          {
-            id,
-            name: attrs.name,
-            description_html: null,
-            app_description: null,
-            uses_api: false,
-            picture_url: devPicture(id),
-            is_public: false,
-            inherits_members: false,
-            creator_id: devProfile.id,
-            inserted_at: now,
-            published_at: null,
-            last_value_at: null,
-            comment_count: 0,
-            reactions: [],
-            can_react: true,
-            description: '',
-            description_format: 'markdown',
-            can_edit: true,
-            member_count: 1,
-            updated_at: now,
-          },
-          attrs,
-        ),
-      );
+    // All or none, as the server: a bad child answers with its index.
+    createChildren(list: PotokNewChild[]): { ok: true; groups: PotokCreatedChild[] } | PotokError {
+      if (!ownGroup.can_manage_children || !ownGroup.can_create_children) return forbidden;
+      if (!Array.isArray(list) || list.length === 0 || list.length > MAX_CHILDREN_PER_CALL) {
+        return { ok: false, error: 'too_large', message: `From 1 to ${MAX_CHILDREN_PER_CALL} groups at a time.` };
+      }
+
+      const seen = new Set<string>();
+      for (const [index, attrs] of list.entries()) {
+        const valid =
+          attrs &&
+          typeof attrs === 'object' &&
+          typeof attrs.name === 'string' &&
+          (attrs as PotokChildAttrs).picture === undefined &&
+          validAttrs(attrs, false) &&
+          validKey(attrs.key) &&
+          (attrs.key === undefined || !seen.has(attrs.key));
+
+        if (!valid) return { ...invalidGroup, index };
+        if (attrs.key !== undefined) seen.add(attrs.key);
+      }
+
+      const byKey = new Map(children.flatMap((child) => (child.key === null ? [] : [[child.key, child] as const])));
+      let id = nextId();
+      const made: PotokChild[] = [];
+
+      const groups = list.map((attrs) => {
+        const existing = attrs.key === undefined ? undefined : byKey.get(attrs.key);
+        if (existing) return { id: existing.id, key: existing.key, created: false };
+
+        const { key, ...rest } = attrs;
+        const child = applyAttrs(newChild(id++, attrs.name, key ?? null), rest);
+        made.push(child);
+        return { id: child.id, key: child.key, created: true };
+      });
+
+      if (made.length > 0) {
+        children = [...children, ...made];
+        saveChildren(children);
+        syncPlaces(made);
+        setTimeout(() => subgroupListeners.forEach((listener) => listener()));
+      }
+
+      return { ok: true, groups };
     },
 
     updateChild(id: number, attrs: PotokChildAttrs): { ok: true; group: PotokChild } | PotokError {
@@ -1285,8 +1539,46 @@ function createServer(el: HTMLElement) {
       return { ok: true, ...loadMapConfig() };
     },
 
-    listPlaces(): { ok: true; places: PotokPlace[]; truncated: boolean } {
-      return { ok: true, places: loadPlaces(), truncated: false };
+    listPlaces(view?: PotokPlacesQuery): { ok: true; places: PotokPlace[]; truncated: boolean } | PotokPlacesAll | PotokPlacesView | PotokError {
+      const places = loadPlaces();
+      if (view === undefined) return { ok: true, places: places.slice(0, MAX_PLACES), truncated: places.length > MAX_PLACES };
+
+      const validView =
+        Array.isArray(view.bbox) &&
+        view.bbox.length === 4 &&
+        view.bbox.every((edge) => typeof edge === 'number') &&
+        Number.isInteger(view.zoom) &&
+        view.zoom >= 0 &&
+        view.zoom <= 24;
+
+      if (!validView) return { ok: false, error: 'invalid_place' };
+      if (places.length <= MAX_PLACES) return { ok: true, mode: 'all', places, truncated: false };
+
+      const config = loadMapConfig();
+      const kept = places.filter(placesFilter(config, view.search, view.pins));
+      return {
+        ok: true,
+        mode: 'view',
+        ...gatherPlaces(kept, view, config),
+        ...(view.extent ? { extent: placesExtent(kept) } : {}),
+        ...(view.counts ? { pins: pinCounts(places, config) } : {}),
+      };
+    },
+
+    listPlacesAt(
+      bounds: PotokBounds,
+      options: { search?: string; pins?: string[] },
+    ): { ok: true; places: PotokPlace[]; has_more: boolean } | PotokError {
+      const valid = Array.isArray(bounds) && bounds.flat().length === 4 && bounds.flat().every((edge) => typeof edge === 'number');
+      if (!valid) return { ok: false, error: 'invalid_place' };
+
+      const [[south, west], [north, east]] = bounds;
+      const rows = loadPlaces()
+        .filter(placesFilter(loadMapConfig(), options.search, options.pins))
+        .filter((place) => place.lat >= south && place.lat <= north && place.lng >= west && place.lng <= east)
+        .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || a.id - b.id);
+
+      return { ok: true, places: rows.slice(0, MAX_SPOT), has_more: rows.length > MAX_SPOT };
     },
 
     // The borders and lines as seeded, whatever the zoom.
@@ -1325,7 +1617,10 @@ function createServer(el: HTMLElement) {
 
       const places = loadPlaces();
       const place: PotokPlace = {
-        id: places.reduce((max, row) => Math.max(max, row.id), 0) + 1,
+        id: Math.max(
+          places.reduce((max, row) => Math.max(max, row.id), 0),
+          children.reduce((max, row) => Math.max(max, row.id), 0),
+        ) + 1,
         name,
         lat: attrs.lat,
         lng: attrs.lng,
@@ -1337,7 +1632,7 @@ function createServer(el: HTMLElement) {
         areas: [],
       };
 
-      localStorage.setItem(PLACES_STORAGE_KEY, JSON.stringify([...places, place]));
+      savePlaces([...places, place]);
       setTimeout(() => subgroupListeners.forEach((listener) => listener()));
 
       return { ok: true, place };
@@ -1905,6 +2200,10 @@ function createSdk(server: DevServer): PotokSdk {
       return server.createChild(attrs);
     },
 
+    async createChildren(list) {
+      return server.createChildren(list);
+    },
+
     async updateChild(id, attrs) {
       return server.updateChild(id, attrs);
     },
@@ -1950,8 +2249,11 @@ function createSdk(server: DevServer): PotokSdk {
       return server.mapConfig();
     },
 
-    async listPlaces() {
-      return server.listPlaces();
+    // One function for both overloads of the type.
+    listPlaces: (async (view?: PotokPlacesQuery) => server.listPlaces(view)) as PotokSdk['listPlaces'],
+
+    async listPlacesAt(bounds, options = {}) {
+      return server.listPlacesAt(bounds, options);
     },
 
     async placeShapes(ids, zoom) {

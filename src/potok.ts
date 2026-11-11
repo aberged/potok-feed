@@ -66,11 +66,13 @@ export type PotokError = {
     | "invalid_match"
     /** `aggregateValues`: a bad key, path or too many fields. */
     | "invalid_aggregate"
-    /** A count or sum took over 5 seconds. */
+    /** A count or sum took over 5 seconds; a map's view took over 4. */
     | "timeout";
   message?: string;
   reason?: string;
   current?: unknown;
+  /** `createChildren`: the position of the child that failed; nothing was saved. */
+  index?: number;
 };
 
 /** A data value, as returned by insert and sent to new value listeners. */
@@ -417,6 +419,13 @@ export type PotokChild = PotokSubgroup & {
   can_edit: boolean;
   member_count: number;
   updated_at: string;
+  /** The app's own key, given by `createChildren`; null for a group made otherwise. */
+  key: string | null;
+  /** Where its pin stands on a map; null for a group without a place. */
+  lat: number | null;
+  lng: number | null;
+  /** A key of `pins.icons` or "picture"; null for its kind's. */
+  pin: string | null;
 };
 
 /** What an app may set on a sub-group. A field left out stays as it is. */
@@ -428,6 +437,37 @@ export type PotokChildAttrs = {
   inheritsMembers?: boolean;
   /** An image URL or a `data:` URL, at most 1,000,000 characters. */
   picture?: string;
+  /**
+   * Where its pin stands on a map (`listPlaces`), rounded to 6 decimals: both
+   * or neither. Both null take the place away (`updateChild`).
+   */
+  lat?: number | null;
+  lng?: number | null;
+  /** A key of `pins.icons` (`getMapConfig`) or "picture"; null for its kind's. */
+  pin?: string | null;
+};
+
+/** A sub-group `createChildren` makes. */
+export type PotokNewChild = Omit<PotokChildAttrs, "picture" | "lat" | "lng" | "pin"> & {
+  name: string;
+  lat?: number;
+  lng?: number;
+  pin?: string;
+  /**
+   * The app's own name for it, 1 to 64 characters without control characters,
+   * unique under this group and set once: a group whose key is there already
+   * is not made again. Groups with a key are records: their own map shows
+   * them, the root's map and the place picker of events do not.
+   */
+  key?: string;
+};
+
+/** What `createChildren` did with one child, in the order they were sent. */
+export type PotokCreatedChild = {
+  id: number;
+  key: string | null;
+  /** false: a group with this key was there already, and `id` is that one. */
+  created: boolean;
 };
 
 /** The app's own group and what the viewer may do there. */
@@ -540,6 +580,74 @@ export type PotokPlaceShape = {
   geojson:
     | { type: 'MultiPolygon'; coordinates: [number, number][][][] }
     | { type: 'MultiLineString'; coordinates: [number, number][][] };
+};
+
+/** `[[south, west], [north, east]]`, as Leaflet takes bounds. */
+export type PotokBounds = [[number, number], [number, number]];
+
+/** What part of a map `listPlaces` reads, and which of its places. */
+export type PotokPlacesQuery = {
+  /** The view's box: [west, south, east, north]. */
+  bbox: [number, number, number, number];
+  /** The map's zoom, 0 to 24. */
+  zoom: number;
+  /** Only places with this in their name (case, accents and script do not count). Big maps only. */
+  search?: string;
+  /** Only places that show one of these: keys of `pins.icons` and "kind" for those that show their kind. Big maps only. */
+  pins?: string[];
+  /** Also `extent`: how many places the filters keep and the box around them. */
+  extent?: boolean;
+  /** Also `pins` in the reply: how many of the map's places show each pin, whatever the filters. */
+  counts?: boolean;
+};
+
+/** Places a big map's view holds too close together to draw one by one. */
+export type PotokPlaceCluster = {
+  count: number;
+  /** Their average position. */
+  lat: number;
+  lng: number;
+  /** The box around them. */
+  bounds: PotokBounds;
+  /** How many of them have each tone (keys of `pins.tones`); tones with none are left out. */
+  tones: Record<string, number>;
+};
+
+/** How many places show a pin: a key of `pins.icons`, "picture", or "kind". */
+export type PotokPinCount = { pin: string; count: number };
+
+/**
+ * `listPlaces(view)` on a map of up to 2000 places: all of them, as without a
+ * view, filtered and gathered by the app. `search`, `pins`, `extent` and
+ * `counts` are ignored: the app works them out from `places`.
+ */
+export type PotokPlacesAll = {
+  ok: true;
+  /** Absent from a Potok older than views. */
+  mode?: "all";
+  places: PotokPlace[];
+  truncated: boolean;
+};
+
+/**
+ * `listPlaces(view)` on a bigger map: Potok gathers the places in the view
+ * into cells of about 64 pixels; a cell with one place gives that place, the
+ * others a cluster.
+ */
+export type PotokPlacesView = {
+  ok: true;
+  mode: "view";
+  /** The places alone in their cells. */
+  places: PotokPlace[];
+  clusters: PotokPlaceCluster[];
+  /** The places the filters keep in the view. */
+  total: number;
+  /** The view had more cells than a reply takes (2000). */
+  truncated: boolean;
+  /** With `extent`; `bounds` null when the filters keep none. */
+  extent?: { count: number; bounds: PotokBounds | null };
+  /** With `counts`, the most shown first. */
+  pins?: PotokPinCount[];
 };
 
 /** A new place: a sub-group from a preset, as Potok's menu makes it, standing at `lat`, `lng`. */
@@ -756,6 +864,18 @@ export type PotokSdk = {
   getChild(id: number): Promise<{ ok: true; group: PotokChild } | PotokError>;
   /** Needs `can_create_children`. Without `isPublic` or `inheritsMembers` only the viewer sees the group. */
   createChild(attrs: PotokChildAttrs & { name: string }): Promise<{ ok: true; group: PotokChild } | PotokError>;
+  /**
+   * Makes up to 100 sub-groups at once, all or none (`invalid_group` with the
+   * `index` of the one that failed), for one write of the rate limit. A child
+   * whose `key` is there already is not made again (`created: false`), so a
+   * call that timed out can be sent again as it was. Needs `can_create_children`.
+   * Open pages hear of the whole call once, and the viewer's unread counts
+   * do not follow the new groups.
+   */
+  createChildren(
+    children: PotokNewChild[],
+    options?: { onExisting?: "skip" },
+  ): Promise<{ ok: true; groups: PotokCreatedChild[] } | PotokError>;
   /** A closed group that opens up moves to the top of the order. */
   updateChild(id: number, attrs: PotokChildAttrs): Promise<{ ok: true; group: PotokChild } | PotokError>;
   /** Closes the group again, and its inherited members leave. Direct members and the viewer stay. */
@@ -797,6 +917,20 @@ export type PotokSdk = {
   getMapConfig(): Promise<({ ok: true } & PotokMapConfig) | PotokError>;
   /** The sub-groups right under this group that the viewer sees and that have a place, up to 2000. */
   listPlaces(): Promise<{ ok: true; places: PotokPlace[]; truncated: boolean } | PotokError>;
+  /**
+   * With a view: all the places of a map of up to 2000 (`mode: "all"`), or
+   * what a bigger map shows in the view, gathered by Potok (`mode: "view"`).
+   * Ask again when the view moves; a view slower than 4 seconds is `timeout`.
+   */
+  listPlaces(view: PotokPlacesQuery): Promise<PotokPlacesAll | PotokPlacesView | PotokError>;
+  /**
+   * The places whose pins stand inside `bounds`, edges included, by name, at
+   * most 50: what a cluster holds that the map cannot spread any further.
+   */
+  listPlacesAt(
+    bounds: PotokBounds,
+    options?: { search?: string; pins?: string[] },
+  ): Promise<{ ok: true; places: PotokPlace[]; has_more: boolean } | PotokError>;
   /**
    * The borders of areas and the lines of routes among `listPlaces` (at most
    * 100 ids), simplified for `zoom`; `level` is the zoom they were simplified

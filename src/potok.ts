@@ -388,7 +388,8 @@ export type PotokSubgroup = {
   /**
    * The description as sanitized HTML, safe to put in the page; a `rich-content`
    * element around it gives the styles of the group page. null for a group
-   * without a description and for an app, whose description is its source code.
+   * without a description and for an app, whose description is its source code,
+   * and for a guest also for a group that keeps its description from guests.
    */
   description_html: string | null;
   /** What an app says about itself in its meta tags, as plain text; null otherwise. */
@@ -397,7 +398,8 @@ export type PotokSubgroup = {
   picture_url: string;
   is_public: boolean;
   inherits_members: boolean;
-  creator_id: number;
+  /** null for a guest, who learns nothing of who made a group. */
+  creator_id: number | null;
   inserted_at: string;
   /** When a closed group (private, not inheriting) last opened up; null if it never was closed. */
   published_at: string | null;
@@ -486,6 +488,12 @@ export type PotokOwnGroup = {
   everyone_creates_subgroups: boolean;
   /** `openPollForm` works for this viewer. */
   can_start_polls: boolean;
+  /**
+   * false for a guest: someone without an account at a public group that opened
+   * its description to guests. The app then only reads; `openLogin` takes them
+   * to log in.
+   */
+  signed_in: boolean;
 };
 
 export type PotokGroupTab = "chat" | "description" | "settings";
@@ -853,6 +861,12 @@ export type PotokSdk = {
   linkGroup(id: number): Promise<{ ok: true } | PotokError>;
   /** The group in the page's address. Nothing checks it: `aroundId` does. */
   getLinkedGroup(): Promise<{ ok: true; group_id: number | null } | PotokError>;
+  /**
+   * For a guest (`getCurrentProfile()` resolves to null): takes the page to
+   * Potok's log-in, which brings them back to this group. A frame cannot leave
+   * the page itself. Anywhere else `unavailable`.
+   */
+  openLogin(): Promise<{ ok: true } | PotokError>;
   getGroup(): Promise<{ ok: true; group: PotokOwnGroup } | PotokError>;
   /**
    * The direct sub-groups, in the order of `listSubgroups`. This and the calls

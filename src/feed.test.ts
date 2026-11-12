@@ -15,7 +15,7 @@ import {
   today,
   type FeedState,
 } from './feed';
-import type { PotokError, PotokSdk, PotokSubgroup, PotokSubgroupListOptions } from './potok';
+import type { PotokError, PotokProfile, PotokSdk, PotokSubgroup, PotokSubgroupListOptions } from './potok';
 
 const story = (id: number): PotokSubgroup => ({
   id,
@@ -75,6 +75,8 @@ function memoryStorage(items: Record<string, string> = {}) {
 
 const reacted = [{ emoji: '👍', count: 3, mine: true }];
 
+const profile = { id: 1, username: 'ana' } as PotokProfile;
+
 function setup({
   listSubgroups = server(50),
   openGroup = vi.fn(async () => ({ ok: true as const })),
@@ -83,6 +85,8 @@ function setup({
   shareGroup = vi.fn(async () => ({ ok: true as const })),
   linkGroup = vi.fn(async () => ({ ok: true as const })),
   getLinkedGroup = vi.fn(async () => ({ ok: true as const, group_id: null as number | null })),
+  getCurrentProfile = vi.fn(async () => profile as PotokProfile | null),
+  openLogin = vi.fn(async () => ({ ok: true as const })),
   storage = memoryStorage(),
 }: {
   listSubgroups?: PotokSdk['listSubgroups'];
@@ -92,11 +96,23 @@ function setup({
   shareGroup?: PotokSdk['shareGroup'];
   linkGroup?: PotokSdk['linkGroup'];
   getLinkedGroup?: PotokSdk['getLinkedGroup'];
+  getCurrentProfile?: PotokSdk['getCurrentProfile'];
+  openLogin?: PotokSdk['openLogin'];
   storage?: ReturnType<typeof memoryStorage>;
 } = {}) {
   const changes: FeedState[] = [];
   const feed = createFeed(
-    { listSubgroups, openGroup, toggleGroupReaction, pickEmoji, shareGroup, linkGroup, getLinkedGroup },
+    {
+      listSubgroups,
+      openGroup,
+      toggleGroupReaction,
+      pickEmoji,
+      shareGroup,
+      linkGroup,
+      getLinkedGroup,
+      getCurrentProfile,
+      openLogin,
+    },
     storage,
     (state) => changes.push(state),
   );
@@ -110,6 +126,8 @@ function setup({
     shareGroup,
     linkGroup,
     getLinkedGroup,
+    getCurrentProfile,
+    openLogin,
     storage,
     changes,
   };
@@ -759,5 +777,47 @@ describe('the address of the page', () => {
     feed.reached(0);
 
     expect(linkGroup).not.toHaveBeenCalled();
+  });
+});
+
+describe('a guest', () => {
+  it('is someone with no profile, and only that', async () => {
+    const guest = setup({ getCurrentProfile: vi.fn(async () => null) });
+    await guest.feed.start();
+    expect(guest.feed.state.guest).toBe(true);
+
+    const member = setup();
+    await member.feed.start();
+    expect(member.feed.state.guest).toBe(false);
+
+    const unknown = setup({ getCurrentProfile: vi.fn(async () => Promise.reject(new Error('timeout'))) });
+    await unknown.feed.start();
+    expect(unknown.feed.state.guest).toBe(false);
+    expect(unknown.feed.state.stories).toHaveLength(PAGE_SIZE);
+  });
+
+  it('logs in and comes back to the same story', async () => {
+    const { feed, openLogin, openGroup, storage } = setup({ getCurrentProfile: vi.fn(async () => null) });
+    await feed.start();
+    await feed.applyFilter(makeFilter('2026-11-01', '2026-11-05'));
+
+    await feed.login(7);
+
+    expect(openLogin).toHaveBeenCalledTimes(1);
+    expect(openGroup).not.toHaveBeenCalled();
+    expect(storage.getItem(RETURN_KEY)).toBe('7');
+    expect(JSON.parse(storage.getItem(RETURN_FILTER_KEY) ?? '{}')).toEqual({ from: '2026-11-01', to: '2026-11-05' });
+  });
+
+  it('forgets the story when the log-in cannot open, and says so', async () => {
+    const { feed, storage } = setup({
+      getCurrentProfile: vi.fn(async () => null),
+      openLogin: failing('unavailable'),
+    });
+
+    await feed.login(7);
+
+    expect(storage.getItem(RETURN_KEY)).toBeNull();
+    expect(feed.state.notice).toBe('login');
   });
 });

@@ -25,7 +25,7 @@ export type Failure = 'no_feed' | 'preview' | 'failed';
 export type DateFilter = { from: string | null; to: string | null };
 
 /** What the viewer tried and could not do. */
-export type Notice = 'open' | 'react' | 'share';
+export type Notice = 'open' | 'react' | 'share' | 'login';
 
 export type FeedState = {
   stories: PotokSubgroup[];
@@ -47,11 +47,24 @@ export type FeedState = {
   /** The period on, or null for all stories. */
   filter: DateFilter | null;
   filterOpen: boolean;
+  /**
+   * Someone without an account, at a feed that opened to guests: they read the
+   * stories that are open to them too, and log in for the rest and the comments.
+   */
+  guest: boolean;
 };
 
 type FeedApi = Pick<
   PotokSdk,
-  'listSubgroups' | 'openGroup' | 'toggleGroupReaction' | 'pickEmoji' | 'shareGroup' | 'linkGroup' | 'getLinkedGroup'
+  | 'listSubgroups'
+  | 'openGroup'
+  | 'toggleGroupReaction'
+  | 'pickEmoji'
+  | 'shareGroup'
+  | 'linkGroup'
+  | 'getLinkedGroup'
+  | 'getCurrentProfile'
+  | 'openLogin'
 >;
 type FeedStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 type ListReply = Awaited<ReturnType<FeedApi['listSubgroups']>>;
@@ -136,6 +149,7 @@ export function createFeed(api: FeedApi, storage: FeedStorage, onChange: (state:
     trayFor: null,
     filter: null,
     filterOpen: false,
+    guest: false,
   };
 
   const update = (patch: Partial<FeedState>) => {
@@ -190,7 +204,13 @@ export function createFeed(api: FeedApi, storage: FeedStorage, onChange: (state:
     const returnId = Number(storage.getItem(RETURN_KEY)) || null;
     update({ loading: true, failure: null, filter: savedFilter(storage) ?? state.filter });
 
-    const linked = await api.getLinkedGroup().catch(() => null);
+    // A guest has no profile; a call that fails says nothing either way.
+    const [linked, profile] = await Promise.all([
+      api.getLinkedGroup().catch(() => null),
+      api.getCurrentProfile().catch(() => undefined),
+    ]);
+    update({ guest: profile === null });
+
     const targetId = returnId ?? (linked?.ok ? linked.group_id : null);
     const loaded = await fetchPage(targetId ?? undefined);
 
@@ -298,6 +318,23 @@ export function createFeed(api: FeedApi, storage: FeedStorage, onChange: (state:
       if (!reply?.ok) {
         forgetReturn();
         notify('open');
+      }
+    },
+
+    /**
+     * For a guest: Potok's log-in, and back to this story once signed in, as
+     * the page brings them back to the feed and this browser keeps the story.
+     */
+    async login(id: number) {
+      update({ notice: null, trayFor: null });
+      storage.setItem(RETURN_KEY, String(id));
+      if (state.filter) storage.setItem(RETURN_FILTER_KEY, JSON.stringify(state.filter));
+
+      const reply = await api.openLogin().catch(() => null);
+
+      if (!reply?.ok) {
+        forgetReturn();
+        notify('login');
       }
     },
 

@@ -446,6 +446,7 @@ function loadOwnGroup(): PotokOwnGroup {
     can_create_children: true,
     everyone_creates_subgroups: false,
     can_start_polls: true,
+    signed_in: true,
   };
 
   try {
@@ -454,6 +455,20 @@ function loadOwnGroup(): PotokOwnGroup {
   } catch {
     return group;
   }
+}
+
+// What a guest gets of a group below, as the server gives it: no author and
+// no reactions of its own; dev groups say `guest_text: false` to keep their text
+// from guests, as a group that keeps its description from them does.
+function asSeenByViewer(group: PotokSubgroup & { guest_text?: boolean }): PotokSubgroup {
+  if (viewerId !== null) return group;
+
+  return {
+    ...group,
+    creator_id: null,
+    can_react: false,
+    description_html: group.guest_text === false ? null : group.description_html,
+  };
 }
 
 // A rough stand-in for the server's sanitizer and markdown: comments and
@@ -1249,8 +1264,9 @@ function createServer(el: HTMLElement) {
       return { ok: true, group: group() };
     },
 
-    currentProfile(): { ok: true; profile: PotokProfile } {
-      return { ok: true, profile: devProfile };
+    // A guest (`?viewer=guest`) has no profile.
+    currentProfile(): { ok: true; profile: PotokProfile | null } {
+      return { ok: true, profile: viewerId === null ? null : devProfile };
     },
 
     listSubgroups(
@@ -1271,7 +1287,12 @@ function createServer(el: HTMLElement) {
 
       const rows = inOrder.filter((group) => beforeId === undefined || group.id < beforeId).slice(0, limit + 1);
 
-      return { ok: true, groups: rows.slice(0, limit), has_more: rows.length > limit, has_newer: false };
+      return {
+        ok: true,
+        groups: rows.slice(0, limit).map(asSeenByViewer),
+        has_more: rows.length > limit,
+        has_newer: false,
+      };
     },
 
     openGroup(id: number, tab: PotokGroupTab | undefined): { ok: true } | PotokError {
@@ -1332,8 +1353,27 @@ function createServer(el: HTMLElement) {
       return { ok: true, group_id: Number(new URLSearchParams(location.search).get(LINK_PARAM)) || null };
     },
 
+    openLogin(): { ok: true } | PotokError {
+      if (viewerId !== null) return { ok: false, error: 'unavailable' };
+
+      console.info("[potok-dev] openLogin: in potok the page goes to Potok's log-in and comes back here.");
+      return { ok: true };
+    },
+
+    // A guest sees the group and nothing it may do there.
     getGroup(): { ok: true; group: PotokOwnGroup } {
-      return { ok: true, group: ownGroup };
+      if (viewerId !== null) return { ok: true, group: ownGroup };
+
+      return {
+        ok: true,
+        group: {
+          ...ownGroup,
+          can_manage_children: false,
+          can_create_children: false,
+          can_start_polls: false,
+          signed_in: false,
+        },
+      };
     },
 
     listChildren(options: PotokSubgroupListOptions): PotokSubgroupPage | PotokError {
@@ -2182,6 +2222,10 @@ function createSdk(server: DevServer): PotokSdk {
 
     async getLinkedGroup() {
       return server.getLinkedGroup();
+    },
+
+    async openLogin() {
+      return server.openLogin();
     },
 
     async getGroup() {

@@ -28,6 +28,7 @@ const NOTICES: Record<Notice, string> = {
   open: 'Ova vest trenutno ne može da se otvori.',
   react: 'Reakcija trenutno ne može da se sačuva.',
   share: 'Ova vest trenutno ne može da se podeli.',
+  login: 'Prijava trenutno ne može da se otvori.',
 };
 
 const chatIcon = html`
@@ -280,6 +281,16 @@ const storyCard = (feed: Feed, story: PotokSubgroup) => html`
         : html`<div class="flex min-h-full flex-col items-center justify-center gap-3 px-8 text-center">
             <h2 class="text-2xl font-semibold">${story.name}</h2>
             ${story.app_description ? html`<p class="max-w-sm opacity-70">${story.app_description}</p>` : nothing}
+            ${feed.state.guest && !story.uses_api
+              ? html`<p class="max-w-sm opacity-70" data-guest-note>Cela vest se čita uz prijavu.</p>
+                  <button
+                    class="d-btn d-btn-primary d-btn-sm"
+                    data-login
+                    @click=${() => void feed.login(story.id)}
+                  >
+                    Prijavi se
+                  </button>`
+              : nothing}
           </div>`}
     </div>
     <footer class="border-base-300 border-t">
@@ -340,7 +351,7 @@ const storyCard = (feed: Feed, story: PotokSubgroup) => html`
             class="d-btn d-btn-sm ml-1 shrink-0 ${story.uses_api ? 'd-btn-ghost' : 'd-btn-primary'}"
             aria-label=${commentsLabel(story)}
             data-comments
-            @click=${() => void feed.open(story.id)}
+            @click=${() => void (feed.state.guest ? feed.login(story.id) : feed.open(story.id))}
           >
             ${chatIcon}
             <span class=${story.uses_api ? 'hidden min-[26rem]:inline' : ''}>Komentari</span>
